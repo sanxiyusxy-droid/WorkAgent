@@ -1,0 +1,24 @@
+# dependencies
+node_modules/
+
+# build artifacts
+dist/
+
+# coverage reports
+coverage/
+
+# evaluation results (machine-specific, may contain model output)
+eval/results/
+
+# local agent state and credentials — never commit
+.agent/
+agent.config.json
+*.local.json
+
+# scratch directories created by tests/scripts
+tmp-*/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.log

@@ -1,0 +1,7 @@
+{
+  "title": "create a new module from a spec",
+  "prompt": "Create a new file tokens.js that implements the API described in SPEC.md. When done, `node check.js` must print OK.",
+  "verify": [
+    { "name": "new module works", "command": "node check.js" }
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "title": "implement a missing function from a spec",
+  "prompt": "Implement clamp() in clamp.js exactly as described in SPEC.md, then confirm `node check.js` prints OK.",
+  "verify": [
+    { "name": "spec check", "command": "node check.js" }
+  ]
+}

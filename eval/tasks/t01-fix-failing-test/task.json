@@ -1,0 +1,7 @@
+{
+  "title": "fix a failing unit test",
+  "prompt": "The test suite in this repo fails. Find the bug and fix it so `node --test` passes. Do not modify the test file.",
+  "verify": [
+    { "name": "unit tests", "command": "node --test test.js" }
+  ]
+}

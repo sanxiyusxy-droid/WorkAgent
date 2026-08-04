@@ -1,0 +1,7 @@
+{
+  "title": "fix an off-by-one boundary bug",
+  "prompt": "paginate.js miscounts the number of pages for certain inputs. The failing cases are listed in check.js. Fix paginate.js (do not touch check.js) until `node check.js` prints OK.",
+  "verify": [
+    { "name": "boundary cases", "command": "node check.js" }
+  ]
+}

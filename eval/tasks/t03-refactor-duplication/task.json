@@ -1,0 +1,7 @@
+{
+  "title": "remove duplicated logic without changing behavior",
+  "prompt": "report.js contains two functions that repeat the same formatting logic. Extract the shared logic into a single helper and use it in both, without changing any output. `node --test test.js` must still pass.",
+  "verify": [
+    { "name": "behavior preserved", "command": "node --test test.js" }
+  ]
+}

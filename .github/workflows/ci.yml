@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+        node: ['20', '22']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Tests (incl. recovery, escape, kill-point suites)
+        run: npm test
+
+      - name: Secret scan
+        # must never skip: the script fails on findings and refuses to
+        # return green for non-git or empty checkouts
+        run: npm run secret-scan
+
+      - name: Build (embeds source commit)
+        run: npm run build
+
+      - name: Install from packed tarball
+        shell: bash
+        run: |
+          npm pack
+          mkdir ../install-check
+          cd ../install-check
+          npm init -y >/dev/null
+          npm install ../code-agent/code-agent-*.tgz --no-audit --no-fund
+          node node_modules/code-agent/dist/agent.mjs --version
+          node node_modules/code-agent/dist/agent.mjs --help >/dev/null

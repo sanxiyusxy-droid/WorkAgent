@@ -1,0 +1,35 @@
+{
+  "description": "Parallel reads + unknown tool: received-order replay, error pairing",
+  "mode": "default",
+  "files": {
+    "a.txt": "alpha content",
+    "b.txt": "beta content"
+  },
+  "turns": [
+    {
+      "calls": [
+        { "id": "c1", "name": "Read", "input": { "path": "a.txt" } },
+        { "id": "c2", "name": "Read", "input": { "path": "b.txt" } },
+        { "id": "c3", "name": "Bogus", "input": {} }
+      ]
+    },
+    { "text": "Read both files; the Bogus tool does not exist." }
+  ],
+  "expectedTrace": [
+    "assistant.message.completed",
+    "tool.call.accepted:c1",
+    "tool.call.accepted:c2",
+    "tool.call.accepted:c3",
+    "permission.decided:Read:allow",
+    "tool.call.completed:c1:ok",
+    "permission.decided:Read:allow",
+    "tool.call.completed:c2:ok",
+    "tool.call.completed:c3:UNKNOWN_TOOL",
+    "tool.result.message",
+    "loop.transitioned:tool_results_ready",
+    "assistant.message.completed",
+    "run.terminated:completed"
+  ],
+  "expectedModelRequests": 2,
+  "expectedFinalFiles": {}
+}

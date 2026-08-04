@@ -1,0 +1,54 @@
+{
+  "description": "Read -> Edit (version precondition) -> Shell evidence -> final answer",
+  "mode": "acceptEdits",
+  "files": {
+    "src/app.ts": "export const answer = 41\n"
+  },
+  "turns": [
+    { "calls": [{ "id": "c1", "name": "Read", "input": { "path": "src/app.ts" } }] },
+    {
+      "calls": [
+        {
+          "id": "c2",
+          "name": "Edit",
+          "input": {
+            "path": "src/app.ts",
+            "oldText": "41",
+            "newText": "42",
+            "expectedVersion": "{{version:src/app.ts}}"
+          }
+        }
+      ]
+    },
+    { "calls": [{ "id": "c3", "name": "Shell", "input": { "command": "echo verified" } }] },
+    { "text": "Changed answer to 42 and verified with echo." }
+  ],
+  "expectedTrace": [
+    "assistant.message.completed",
+    "tool.call.accepted:c1",
+    "permission.decided:Read:allow",
+    "tool.call.completed:c1:ok",
+    "tool.result.message",
+    "loop.transitioned:tool_results_ready",
+    "assistant.message.completed",
+    "tool.call.accepted:c2",
+    "permission.decided:Edit:allow",
+    "workspace.changed",
+    "tool.call.completed:c2:ok",
+    "tool.result.message",
+    "loop.transitioned:tool_results_ready",
+    "assistant.message.completed",
+    "tool.call.accepted:c3",
+    "permission.decided:Shell:allow",
+    "evidence.recorded",
+    "tool.call.completed:c3:ok",
+    "tool.result.message",
+    "loop.transitioned:tool_results_ready",
+    "assistant.message.completed",
+    "run.terminated:completed"
+  ],
+  "expectedModelRequests": 4,
+  "expectedFinalFiles": {
+    "src/app.ts": "export const answer = 42\n"
+  }
+}

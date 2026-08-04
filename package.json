@@ -1,0 +1,40 @@
+{
+  "name": "code-agent",
+  "version": "1.0.0-rc.1",
+  "description": "A resumable, contract-driven CLI code agent",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "code-agent": "./dist/agent.mjs",
+    "ca": "./dist/agent.mjs"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=18.17"
+  },
+  "scripts": {
+    "cli": "tsx src/cli/main.ts",
+    "build": "node scripts/build.mjs",
+    "start": "node dist/agent.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:cov": "vitest run --coverage",
+    "test:watch": "vitest",
+    "secret-scan": "node scripts/secret-scan.mjs",
+    "eval": "tsx eval/run-eval.ts",
+    "precommit": "node scripts/secret-scan.mjs"
+  },
+  "dependencies": {
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@vitest/coverage-v8": "^2.1.9",
+    "esbuild": "^0.21.5",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0",
+    "vitest": "^2.0.0"
+  }
+}
