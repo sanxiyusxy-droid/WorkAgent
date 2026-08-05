@@ -8,7 +8,7 @@
  */
 import { build } from 'esbuild'
 import { execFileSync } from 'node:child_process'
-import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -29,6 +29,10 @@ try {
   // no git available (e.g. tarball build): the version string still ships
 }
 
+// Start from a clean dist: leftover files (e.g. a stray .agent session
+// directory from running the CLI with dist/ as workspace) would otherwise be
+// packed into the tarball by `files: ["dist"]` and leak user data.
+await rm(outDir, { recursive: true, force: true })
 await mkdir(outDir, { recursive: true })
 
 const result = await build({

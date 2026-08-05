@@ -7,6 +7,9 @@ import { createHash } from 'node:crypto'
  *
  *   not_started → running → committed
  *                         → unknown (interrupted mid-execution)
+ *   committed/unknown → resolved_applied   (inspectOutcome proved the effect)
+ *   committed/unknown → resolved_not_applied (proof gone → re-execute)
+ *   running/unknown   → abandoned          (operation given up, re-executable)
  *
  * Two identities are tracked:
  * - callId: the model-protocol identity of one tool_call (changes on every
@@ -14,15 +17,28 @@ import { createHash } from 'node:crypto'
  * - operationKey: the BUSINESS identity of the side effect — hash of
  *   (sessionId, toolName, canonical args) WITHOUT callId. It identifies
  *   semantic duplicates even when the model retries with a new callId.
+ *   Tools with idempotencyScope='invocation' (e.g. Shell) use the call-level
+ *   key instead so a fresh repeat of the same command stays legitimate.
  *
  * On recovery:
- * - committed (by operationKey) → skip re-execution entirely; the commitProof
- *   (file version hash etc.) lets humans verify the effect is really there
- * - running / unknown → MUST inspect external state before retrying; the
- *   runtime refuses blind re-execution
- * - not_started → safe to execute normally
+ * - committed / resolved_applied → deduplicate; the runtime RE-VERIFIES the
+ *   commit proof via inspectOutcome when the tool supports it (a file edited
+ *   back externally no longer counts as applied and gets re-executed)
+ * - running / unknown → inspectOutcome adjudicates into resolved_applied /
+ *   resolved_not_applied; without a probe, blind re-execution is refused
+ * - resolved_not_applied / abandoned / not_started → safe to execute
  */
-export type ExecutionStatus = 'not_started' | 'running' | 'committed' | 'unknown'
+export type ExecutionStatus =
+  | 'not_started'
+  | 'running'
+  | 'committed'
+  | 'unknown'
+  | 'resolved_applied'
+  | 'resolved_not_applied'
+  | 'abandoned'
+
+/** Statuses an adjudication may move a record into. */
+export type AdjudicatedStatus = 'resolved_applied' | 'resolved_not_applied' | 'abandoned'
 
 export interface IdempotencyRecord {
   /** unique key: hash of (sessionId, toolName, canonical input) — the
@@ -35,6 +51,8 @@ export interface IdempotencyRecord {
   updatedAt: string
   /** externally checkable proof of the applied effect (file SHA, version) */
   proof?: string
+  /** human-readable outcome of the last adjudication (audit trail) */
+  detail?: string
 }
 
 /**
@@ -92,8 +110,10 @@ export class IdempotencyLedger {
   }
 
   /**
-   * @deprecated kept for backwards compatibility; prefer computeOperationKey.
-   * Call-level key binds one specific protocol call (includes callId).
+   * Compute the CALL-level key: the protocol identity of one tool_call
+   * (includes callId). Used by tools with idempotencyScope='invocation'
+   * (e.g. Shell) so only the crash-recovery replay of the SAME call
+   * dedupes, while a fresh repeat of the same command stays legitimate.
    */
   static computeKey(input: {
     sessionId: string
@@ -123,6 +143,12 @@ export class IdempotencyLedger {
   /** Check if a call was already committed (safe to skip). */
   isCommitted(key: string): boolean {
     return this.records.get(key)?.status === 'committed'
+  }
+
+  /** Effect confirmed applied: committed, or adjudicated resolved_applied. */
+  isApplied(key: string): boolean {
+    const status = this.records.get(key)?.status
+    return status === 'committed' || status === 'resolved_applied'
   }
 
   /** Check if a call needs external state inspection before retry. */
@@ -162,6 +188,29 @@ export class IdempotencyLedger {
       record.updatedAt = now
       this.dirty = true
     }
+  }
+
+  /**
+   * Adjudicate an uncertain or stale record into a terminal resolution.
+   * Returns the previous status so callers can emit an audit fact.
+   * - resolved_applied: the effect was verified present → deduplicate
+   * - resolved_not_applied: proof no longer holds → re-execution is safe
+   * - abandoned: the operation was given up → re-execution is safe
+   */
+  adjudicate(
+    key: string,
+    to: AdjudicatedStatus,
+    detail: string,
+    now: string,
+  ): ExecutionStatus | undefined {
+    const record = this.records.get(key)
+    if (!record) return undefined
+    const from = record.status
+    record.status = to
+    record.detail = detail
+    record.updatedAt = now
+    this.dirty = true
+    return from
   }
 
   /** All records with a given status (for recovery inspection). */

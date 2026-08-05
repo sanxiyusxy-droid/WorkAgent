@@ -303,6 +303,14 @@ export class Renderer {
         }
         return
 
+      case 'replan.adjustment.applied':
+        this.line(
+          style.yellow(
+            `${symbol.plan} replan adjusted (${event.cause}): ${oneLine(event.summary, 80)}`,
+          ),
+        )
+        return
+
       case 'tool.progress': {
         // live tool output (shell streaming): write complete lines now,
         // buffer a trailing partial line until the next chunk arrives

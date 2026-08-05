@@ -3,7 +3,7 @@ import { access, mkdir, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { defineTool } from '../Tool.js'
 import { checkPath, checkPathReal } from '../../policy/pathPolicy.js'
-import { computeVersion } from '../../workspace/FileVersion.js'
+import { computeVersion, readFileVersion } from '../../workspace/FileVersion.js'
 
 const WriteInput = z
   .object({
@@ -132,4 +132,23 @@ export const WriteTool = defineTool<z.infer<typeof WriteInput>, WriteOutput>({
       `${output.created ? 'Created' : 'Overwrote'} ${output.path} ` +
       `(${output.bytes} bytes)\nnewVersion: ${output.newVersion}`,
   }),
+
+  // Adjudication probe: the expected post-state is the content hash of the
+  // write itself (the ledger proof, or derived from the input when an
+  // interrupted run never recorded one). Compare it with the live file to
+  // decide whether a repeat is a duplicate (skip) or a re-apply after
+  // external modification (execute).
+  inspectOutcome: async (input, ctx, record) => {
+    const expected = record.proof ?? computeVersion(input.content)
+    const check = await checkPathReal(input.path, ctx.workspaceRoot)
+    if (!check.ok) return { applied: false, detail: `path rejected: ${check.reason}` }
+    try {
+      const { version } = await readFileVersion(check.resolved)
+      return version === expected
+        ? { applied: true, detail: `file content matches expected version ${expected}` }
+        : { applied: false, detail: 'file content differs from expected version' }
+    } catch {
+      return { applied: false, detail: 'target file no longer exists' }
+    }
+  },
 })

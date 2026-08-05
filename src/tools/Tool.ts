@@ -9,9 +9,27 @@ import type { PlanStore, ApprovalRegistry } from '../planning/PlanStore.js'
 import type { TaskStore } from '../planning/TaskStore.js'
 import type { EvidenceStore } from '../verification/EvidenceStore.js'
 import type { PlanVersion } from '../planning/types.js'
+import type { IdempotencyRecord } from './IdempotencyLedger.js'
 
 export type ConcurrencyClass = 'shared' | 'exclusive'
 export type InterruptBehavior = 'cancel' | 'block'
+
+/**
+ * Duplicate-execution policy for side-effecting tools (finish-list §1.4).
+ * - 'operation': the args-derived operation key identifies one BUSINESS
+ *   operation for the whole session (file writes: same args = same effect).
+ * - 'invocation': dedupe only the exact protocol call (callId), i.e. the
+ *   crash-recovery replay of the SAME call. A fresh call repeating the same
+ *   command at a later stage is legitimate and must not be blocked.
+ */
+export type IdempotencyScope = 'operation' | 'invocation'
+
+/** Outcome of re-checking external state against a ledger record. */
+export interface OutcomeInspection {
+  /** true = the committed effect is verifiably present right now */
+  applied: boolean
+  detail: string
+}
 
 export interface ResourceClaim {
   resource: string
@@ -71,6 +89,8 @@ export interface ToolDefinition<Input = unknown, Output = unknown> {
   readonly description: string
   readonly inputSchema: z.ZodType<Input, z.ZodTypeDef, any>
   readonly maxResultChars: number
+  /** duplicate-execution policy; defaults to 'operation' */
+  readonly idempotencyScope: IdempotencyScope
 
   readOnly(input: Input): boolean
   destructive(input: Input): boolean
@@ -86,6 +106,17 @@ export interface ToolDefinition<Input = unknown, Output = unknown> {
     progress: (value: unknown) => void,
   ): Promise<ToolExecutionResult<Output>>
   serialize(output: Output, callId: string): ToolResultContent
+  /**
+   * Adjudication probe (finish-list §1.4): re-check external state against
+   * a ledger record (committed / running / unknown). File tools compare the
+   * current content hash with the commit proof; tools without a verifiable
+   * outcome omit this and the runtime keeps refusing blind re-execution.
+   */
+  inspectOutcome?(
+    input: Input,
+    ctx: ToolContext,
+    record: IdempotencyRecord,
+  ): Promise<OutcomeInspection>
 }
 
 /**
@@ -98,6 +129,7 @@ export interface ToolSpec<Input, Output> {
   description: string
   inputSchema: z.ZodType<Input, z.ZodTypeDef, any>
   maxResultChars?: number
+  idempotencyScope?: IdempotencyScope
   readOnly?: (input: Input) => boolean
   destructive?: (input: Input) => boolean
   concurrency?: (input: Input) => ConcurrencyClass
@@ -111,6 +143,11 @@ export interface ToolSpec<Input, Output> {
     progress: (value: unknown) => void,
   ) => Promise<ToolExecutionResult<Output>>
   serialize?: (output: Output, callId: string) => ToolResultContent
+  inspectOutcome?: (
+    input: Input,
+    ctx: ToolContext,
+    record: IdempotencyRecord,
+  ) => Promise<OutcomeInspection>
 }
 
 export function defineTool<Input, Output>(
@@ -121,6 +158,7 @@ export function defineTool<Input, Output>(
     description: spec.description,
     inputSchema: spec.inputSchema,
     maxResultChars: spec.maxResultChars ?? 30_000,
+    idempotencyScope: spec.idempotencyScope ?? 'operation',
     readOnly: spec.readOnly ?? (() => false),
     destructive: spec.destructive ?? (() => false),
     concurrency: spec.concurrency ?? (() => 'exclusive'),
@@ -136,5 +174,6 @@ export function defineTool<Input, Output>(
         kind: 'json',
         value: output,
       })),
+    inspectOutcome: spec.inspectOutcome,
   }
 }

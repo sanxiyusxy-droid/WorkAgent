@@ -453,6 +453,14 @@ describe('verification E2E', () => {
         expect(replan!.requiresReapproval).toBe(false)
       }
 
+      // low-impact replan: the durable adjustment fact closes replanning
+      // without waiting for a model reply
+      const adjustment = result.facts.find(f => f.type === 'replan.adjustment.applied')
+      expect(adjustment).toBeDefined()
+      if (adjustment!.type === 'replan.adjustment.applied') {
+        expect(adjustment!.cause).toBe('verification_failed')
+      }
+
       expect(result.terminal.reason).toBe('completed_with_unverified_items')
     } finally {
       await world.cleanup()

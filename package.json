@@ -1,6 +1,6 @@
 {
   "name": "code-agent",
-  "version": "1.0.0-rc.1",
+  "version": "1.0.0-rc.2",
   "description": "A resumable, contract-driven CLI code agent",
   "license": "MIT",
   "type": "module",
@@ -23,6 +23,8 @@
     "test:cov": "vitest run --coverage",
     "test:watch": "vitest",
     "secret-scan": "node scripts/secret-scan.mjs",
+    "check:package": "node scripts/check-package.mjs",
+    "prepack": "npm run typecheck && npm test && npm run secret-scan && npm run build && npm run check:package",
     "eval": "tsx eval/run-eval.ts",
     "precommit": "node scripts/secret-scan.mjs"
   },

@@ -3,7 +3,7 @@ import { readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { defineTool } from '../Tool.js'
 import { checkPath, checkPathReal } from '../../policy/pathPolicy.js'
-import { computeVersion } from '../../workspace/FileVersion.js'
+import { computeVersion, readFileVersion } from '../../workspace/FileVersion.js'
 import { matchForReplace } from '../../workspace/lineEndings.js'
 import { InvariantError } from '../../core/messages.js'
 
@@ -268,4 +268,28 @@ export const ApplyPatchTool = defineTool<
         .map(f => `  ${f.action}: ${f.path} -> ${f.newVersion}`)
         .join('\n'),
   }),
+
+  // Adjudication probe: the commit proof is `path@version;...` for every
+  // patched file — ALL files must still match for the patch to count as
+  // applied; any divergence re-opens the operation for re-execution.
+  inspectOutcome: async (_input, ctx, record) => {
+    if (!record.proof) return { applied: false, detail: 'no commit proof recorded' }
+    for (const entry of record.proof.split(';')) {
+      const separator = entry.lastIndexOf('@')
+      if (separator < 0) return { applied: false, detail: `malformed proof entry: ${entry}` }
+      const path = entry.slice(0, separator)
+      const expected = entry.slice(separator + 1)
+      const check = await checkPathReal(path, ctx.workspaceRoot)
+      if (!check.ok) return { applied: false, detail: `path rejected: ${check.reason}` }
+      try {
+        const { version } = await readFileVersion(check.resolved)
+        if (version !== expected) {
+          return { applied: false, detail: `${path} differs from commit proof` }
+        }
+      } catch {
+        return { applied: false, detail: `${path} no longer exists` }
+      }
+    }
+    return { applied: true, detail: 'all patched files match their commit proofs' }
+  },
 })

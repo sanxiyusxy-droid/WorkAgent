@@ -21,6 +21,7 @@ import type { TaskStore } from '../planning/TaskStore.js'
 import type { EvidenceStore } from '../verification/EvidenceStore.js'
 import type { VerifierRunner } from '../verification/VerifierRunner.js'
 import { evaluateCompletion } from '../planning/completionGate.js'
+import { findStaleReceipts } from '../verification/freshness.js'
 import {
   detectReplanTrigger,
   checkPlanConstraints,
@@ -282,11 +283,17 @@ export class AgentEngine {
         yield { type: 'status.changed', phase: state.phase }
 
         if (this.d.gate) {
+          // freshness snapshot for the gate: receipts signed for an older
+          // workspace revision cannot complete this run (finish-list §1.6)
+          const staleEvidenceIds = this.d.gate.evidence
+            ? await findStaleReceipts(this.d.gate.evidence)
+            : undefined
           const gate = evaluateCompletion({
             state,
             approvedPlan: this.d.gate.plans?.lastApproved(),
             evidence: this.d.gate.evidence?.list() ?? [],
             riskThreshold: this.d.gate.riskThreshold,
+            staleEvidenceIds,
           })
 
           if (gate.action === 'continue') {
@@ -795,6 +802,20 @@ export class AgentEngine {
     }
     yield transitionFact
     state = yield* this.persistAndReduce(state, transitionFact, 'buffered')
+
+    if (!replan.requiresReapproval) {
+      // low-impact replans close here: a durable adjustment fact records
+      // WHAT changed and WHY, and the reducer exits `replanning`. The loop
+      // never relies on the model replying "I adjusted" to end the state.
+      const adjustmentFact: FactEvent = {
+        type: 'replan.adjustment.applied',
+        cause: replan.cause?.type ?? 'unknown',
+        summary: replan.message,
+      }
+      yield adjustmentFact
+      state = yield* this.persistAndReduce(state, adjustmentFact, 'flush')
+    }
+
     return state
   }
 

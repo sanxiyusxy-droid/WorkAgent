@@ -15,6 +15,13 @@ import { redactDeep } from '../security/secrets.js'
  */
 export class EvidenceStore {
   private readonly receipts = new Map<string, EvidenceReceipt>()
+  /**
+   * Workspace revision: the number of workspace.changed facts observed so
+   * far. Bumped by the tool runtime when a write tool changes the workspace
+   * and restored from the journal during recovery, so receipts signed before
+   * a change can be detected as stale (finish-list §1.6).
+   */
+  private revision = 0
 
   constructor(
     private readonly deps: {
@@ -28,6 +35,20 @@ export class EvidenceStore {
     },
   ) {}
 
+  get workspaceRevision(): number {
+    return this.revision
+  }
+
+  /** A write tool changed the workspace: every unbound receipt ages. */
+  bumpWorkspaceRevision(): number {
+    return ++this.revision
+  }
+
+  /** Restore the counter from journal replay (count of workspace.changed). */
+  setWorkspaceRevision(revision: number): void {
+    this.revision = revision
+  }
+
   async record(input: {
     kind: EvidenceKind
     status: EvidenceReceipt['status']
@@ -37,6 +58,8 @@ export class EvidenceStore {
     observation: EvidenceReceipt['observation']
     startedAt: string
     fileVersions?: Record<string, string>
+    /** defaults to the store's current workspace revision */
+    workspaceRevision?: number
   }): Promise<EvidenceReceipt> {
     // SANITIZING SINK: evidence captures command output verbatim, which may
     // contain credentials printed by failing processes — redact before the
@@ -58,6 +81,7 @@ export class EvidenceStore {
       sha256: '', // filled below — the hash covers the binding fields too
       workspaceRoot: this.deps.workspaceRoot,
       fileVersions: input.fileVersions,
+      workspaceRevision: input.workspaceRevision ?? this.revision,
     }
     receipt.sha256 = createHash('sha256')
       .update(JSON.stringify(receiptHashBody(receipt)))
@@ -104,8 +128,8 @@ export class EvidenceStore {
 
 /**
  * Canonical hash body of a receipt. Covers every binding field: changing
- * status, criterionIds, taskId, workspaceRoot, fileVersions or session/run
- * identity invalidates the signature.
+ * status, criterionIds, taskId, workspaceRoot, fileVersions, workspaceRevision
+ * or session/run identity invalidates the signature.
  */
 export function receiptHashBody(receipt: EvidenceReceipt): Record<string, unknown> {
   return {
@@ -121,6 +145,7 @@ export function receiptHashBody(receipt: EvidenceReceipt): Record<string, unknow
     completedAt: receipt.completedAt,
     workspaceRoot: receipt.workspaceRoot ?? null,
     fileVersions: receipt.fileVersions ?? null,
+    workspaceRevision: receipt.workspaceRevision ?? null,
   }
 }
 

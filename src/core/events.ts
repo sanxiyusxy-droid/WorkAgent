@@ -127,10 +127,28 @@ export type FactEvent =
   | { type: 'plan.approved'; planId: string; version: number; tokenId: string }
   /** replan protocol: the engine forced a replan; state enters `replanning` */
   | { type: 'replan.requested'; cause: string; requiresReapproval: boolean }
+  /**
+   * low-impact replan closure: the adjustment was applied and persisted
+   * (no new plan version, no re-approval). Ends the `replanning` state.
+   */
+  | { type: 'replan.adjustment.applied'; cause: string; summary: string }
   /** a persisted plan version left its previous status (reapproval replans supersede approved plans) */
   | { type: 'plan.status.changed'; planId: string; version: number; status: 'superseded' }
   | { type: 'task.changed'; task: PlanTask }
   | { type: 'evidence.recorded'; receipt: EvidenceReceipt }
+  /**
+   * idempotency adjudication audit (finish-list §1.4): the runtime resolved
+   * a committed/uncertain side-effect record by inspecting external state.
+   * Audit-only: carries no state transition.
+   */
+  | {
+      type: 'idempotency.adjudicated'
+      toolName: string
+      callId: string
+      from: string
+      to: string
+      detail: string
+    }
   | { type: 'verification.completed'; report: VerificationReport; valid: boolean }
   | { type: 'context.compacted'; record: CompactRecord }
   | { type: 'loop.transitioned'; transition: ContinueTransition }
@@ -142,6 +160,18 @@ export type FactEvent =
       type: 'workspace.changed'
       path: string
       change: 'created' | 'modified' | 'deleted'
+    }
+  /**
+   * degraded recovery provenance (finish-list §1.5): this session is a
+   * recovery branch forked from a corrupt journal, which stays untouched.
+   * Audit-only: carries no state transition.
+   */
+  | {
+      type: 'session.recovery.branch'
+      fromSessionId: string
+      /** first seq that could not be trusted in the source journal */
+      failureSeq: number
+      issues: string[]
     }
 
 /**
@@ -215,15 +245,18 @@ const FACT_TYPES = new Set<string>([
   'plan.version.created',
   'plan.approved',
   'replan.requested',
+  'replan.adjustment.applied',
   'plan.status.changed',
   'task.changed',
   'evidence.recorded',
+  'idempotency.adjudicated',
   'verification.completed',
   'context.compacted',
   'loop.transitioned',
   'run.terminated',
   'state.snapshot',
   'workspace.changed',
+  'session.recovery.branch',
 ])
 
 export function isFactEvent(event: AgentEvent): event is FactEvent {

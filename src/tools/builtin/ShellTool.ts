@@ -174,6 +174,10 @@ function buildShellTool(name: 'Shell' | 'ShellReadOnly') {
           'Available in plan mode.',
     inputSchema: ShellInput,
     maxResultChars: 30_000,
+    // invocation scope: dedupe only the crash-recovery replay of the SAME
+    // call. Re-running an identical command at a later stage (e.g. npm test
+    // after code changes) is legitimate and must not be blocked.
+    idempotencyScope: 'invocation',
     readOnly:
       name === 'ShellReadOnly'
         ? () => true

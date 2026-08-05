@@ -39,13 +39,19 @@ jobs:
       - name: Build (embeds source commit)
         run: npm run build
 
+      - name: Package content allowlist
+        # fail the pipeline if the tarball would ship .agent sessions,
+        # journals, evidence, configs or any non-allowlisted file
+        run: npm run check:package
+
       - name: Install from packed tarball
         shell: bash
         run: |
           npm pack
+          TGZ=$(ls code-agent-*.tgz)
           mkdir ../install-check
           cd ../install-check
           npm init -y >/dev/null
-          npm install ../code-agent/code-agent-*.tgz --no-audit --no-fund
+          npm install "$GITHUB_WORKSPACE/$TGZ" --no-audit --no-fund
           node node_modules/code-agent/dist/agent.mjs --version
           node node_modules/code-agent/dist/agent.mjs --help >/dev/null

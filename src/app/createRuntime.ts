@@ -62,6 +62,12 @@ export interface RuntimeConfig {
   context?: Partial<ContextBudgetConfig> & { enabled?: boolean }
   /** hash of the effective merged config, recorded in run.started */
   configHash?: string
+  /**
+   * Degraded recovery branch (finish-list §1.5): load history from this
+   * session's journal but write all new facts to the NEW session's own
+   * journal, so the corrupt source journal stays untouched.
+   */
+  recoveryForkFrom?: string
 }
 
 export interface RuntimeChannels {
@@ -122,10 +128,14 @@ export async function createRuntime(input: {
   const sessionDir = join(config.workspaceRoot, '.agent', 'sessions', sessionId)
   const journalPath = join(sessionDir, 'journal.jsonl')
 
-  // resume if requested and a journal exists
+  // resume if requested and a journal exists. A degraded recovery branch
+  // reads the SOURCE session's journal while writing to its own directory.
   let loaded: LoadedSession | null = null
-  if (config.sessionId && config.persist !== false) {
-    loaded = await loadSession(journalPath)
+  const loadFromPath = config.recoveryForkFrom
+    ? join(config.workspaceRoot, '.agent', 'sessions', config.recoveryForkFrom, 'journal.jsonl')
+    : journalPath
+  if ((config.sessionId || config.recoveryForkFrom) && config.persist !== false) {
+    loaded = await loadSession(loadFromPath)
   }
 
   const journal =
@@ -350,12 +360,16 @@ export interface ReplayFailure {
 /**
  * Replay a run of journal envelopes through the reducer. Events that are
  * recovery no-ops (run.started, state.snapshot) are skipped. On invariant
- * violation the failing event is skipped in degraded mode so recovery stays
- * available — but the failure is always reported.
+ * violation the behavior depends on the mode:
+ * - strict (default): replay STOPS at the failing event; the recovered state
+ *   is exactly the state at lastTrustedSeq and the failure is reported.
+ * - degraded: only the offending event is skipped and replay continues, so
+ *   recovery stays available — but the failure is always reported.
  */
 function replayEnvelopes(
   state: AgentState,
   envelopes: JournalEnvelope[],
+  degraded: boolean,
 ): { state: AgentState; failure: ReplayFailure | null } {
   let failure: ReplayFailure | null = null
   let lastTrustedSeq = 0
@@ -374,12 +388,21 @@ function replayEnvelopes(
           error instanceof InvariantError ? error.invariant : 'reducer_error',
         message: (error as Error).message,
         lastTrustedSeq,
-        allowDegraded: true,
+        allowDegraded: degraded,
       }
+      if (!degraded) break // strict: refuse to replay past a corrupt fact
       // degraded continuation: skip only the offending event
     }
   }
   return { state, failure }
+}
+
+export interface ResumeOptions {
+  /**
+   * true = skip corrupt facts and continue (explicit user choice only);
+   * false/omitted = strict: stop at the first failure, refuse to continue.
+   */
+  degraded?: boolean
 }
 
 /**
@@ -394,12 +417,14 @@ function replayEnvelopes(
 export async function resumeState(
   runtime: AgentRuntime,
   loaded: LoadedSession,
+  options?: ResumeOptions,
 ): Promise<{
   state: AgentState
   recoveryFacts: FactEvent[]
   replayFailure: ReplayFailure | null
 }> {
   let state = runtime.makeInitialState()
+  const degraded = options?.degraded === true
 
   // load idempotency ledger so re-execution can be skipped
   await runtime.toolRuntime.idempotency.load()
@@ -415,12 +440,12 @@ export async function resumeState(
       typeof snapshot.lastSeq === 'number'
         ? loaded.envelopes.filter(e => e.seq > snapshot.lastSeq!)
         : loaded.envelopes.slice(loaded.tailStartIndex)
-    const replayed = replayEnvelopes(state, tail)
+    const replayed = replayEnvelopes(state, tail, degraded)
     state = replayed.state
     replayFailure = replayed.failure
   } else {
     // Phase 1b: no V2 checkpoint -> full deterministic replay of every fact
-    const replayed = replayEnvelopes(state, loaded.envelopes)
+    const replayed = replayEnvelopes(state, loaded.envelopes, degraded)
     state = replayed.state
     replayFailure = replayed.failure
   }
@@ -445,6 +470,16 @@ export async function resumeState(
   for (const plan of loaded.plans) {
     runtime.plans.restore(plan)
   }
+
+  // restore the workspace revision counter from the journal so freshness
+  // judgments after recovery match the pre-crash view (finish-list §1.6)
+  let workspaceRevision = 0
+  for (const envelope of loaded.envelopes) {
+    if ((envelope.event as FactEvent).type === 'workspace.changed') {
+      workspaceRevision += 1
+    }
+  }
+  runtime.evidence.setWorkspaceRevision(workspaceRevision)
 
   // Phase 3: close orphan tool calls
   const recoveryFacts: FactEvent[] = []

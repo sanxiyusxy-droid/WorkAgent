@@ -13,8 +13,12 @@ import { GlobTool } from '../tools/builtin/GlobTool.js'
 import { GrepTool } from '../tools/builtin/GrepTool.js'
 import { ShellReadOnlyTool } from '../tools/builtin/ShellTool.js'
 import type { EvidenceStore } from './EvidenceStore.js'
-import { readFileVersion } from '../workspace/FileVersion.js'
 import type { PlanVersion } from '../planning/types.js'
+
+// freshness lives in its own module (AgentEngine's completion gate needs it
+// without importing VerifierRunner, which imports AgentEngine)
+import { findStaleReceipts } from './freshness.js'
+export { findStaleReceipts }
 import type { Clock, IdGenerator } from '../core/runtimePrimitives.js'
 import type { VerificationReport } from './types.js'
 import { validateReport, VerificationReportSchema } from './verdict.js'
@@ -47,32 +51,6 @@ export interface VerifierOutcome {
   report: VerificationReport
   valid: boolean
   validationError?: string
-}
-
-/**
- * Evidence freshness: a receipt whose bound fileVersions no longer match
- * the workspace was signed for a PREVIOUS version of the code and cannot
- * support a verdict about the current one. Missing files count as stale —
- * the observation no longer reflects reality either.
- */
-export async function findStaleReceipts(evidence: EvidenceStore): Promise<Set<string>> {
-  const stale = new Set<string>()
-  for (const receipt of evidence.list()) {
-    if (!receipt.fileVersions || Object.keys(receipt.fileVersions).length === 0) continue
-    for (const [path, signedVersion] of Object.entries(receipt.fileVersions)) {
-      try {
-        const current = await readFileVersion(path)
-        if (current.version !== signedVersion) {
-          stale.add(receipt.id)
-          break
-        }
-      } catch {
-        stale.add(receipt.id)
-        break
-      }
-    }
-  }
-  return stale
 }
 
 /**

@@ -156,17 +156,23 @@ describe('StateSnapshotV2 recovery equivalence', () => {
         workspaceRoot: world1.workspaceRoot,
         turns: [],
       })
-      const { state, replayFailure } = await resumeState(world2.runtime, world2.loaded!)
 
-      // the failure is fully described...
+      // STRICT (default): the failure is fully described and replay refuses
+      // to continue past the corrupt fact (allowDegraded=false)
+      const strict = await resumeState(world2.runtime, world2.loaded!)
+      expect(strict.replayFailure).not.toBeNull()
+      expect(strict.replayFailure!.invariant).toBe('single_terminal_tool_result')
+      expect(strict.replayFailure!.seq).toBe(loaded1.nextSeq)
+      expect(strict.replayFailure!.eventId).toBeTruthy()
+      expect(strict.replayFailure!.allowDegraded).toBe(false)
+      expect(strict.replayFailure!.lastTrustedSeq).toBeLessThan(strict.replayFailure!.seq)
+
+      // DEGRADED (explicit opt-in): skip the bad fact and keep a usable state
+      const { state, replayFailure } = await resumeState(world2.runtime, world2.loaded!, {
+        degraded: true,
+      })
       expect(replayFailure).not.toBeNull()
-      expect(replayFailure!.invariant).toBe('single_terminal_tool_result')
-      expect(replayFailure!.seq).toBe(loaded1.nextSeq)
-      expect(replayFailure!.eventId).toBeTruthy()
       expect(replayFailure!.allowDegraded).toBe(true)
-      expect(replayFailure!.lastTrustedSeq).toBeLessThan(replayFailure!.seq)
-
-      // ...and degraded continuation still yields a usable state
       expect(state.messages.length).toBeGreaterThan(0)
       expect(state.toolResults['c1']).toBeDefined()
     } finally {
@@ -176,7 +182,7 @@ describe('StateSnapshotV2 recovery equivalence', () => {
 })
 
 describe('operation-level idempotency', () => {
-  test('same operation with a NEW callId is not re-executed', async () => {
+  test('same operation with a NEW callId is deduplicated as a SUCCESS', async () => {
     const world = await makeWorld({
       mode: 'bypassPermissions',
       turns: [
@@ -205,9 +211,11 @@ describe('operation-level idempotency', () => {
       )
       expect(second).toBeDefined()
       if (second!.type === 'tool.call.completed') {
-        expect(second!.result.ok).toBe(false)
-        expect(second!.result.errorCode).toBe('ALREADY_COMMITTED')
-        // the commit proof (file version hash) is surfaced for inspection
+        // finish-list §1.4: proof re-verification succeeds → the repeat
+        // surfaces as a successful deduplicated result, not a tool failure
+        expect(second!.result.ok).toBe(true)
+        expect(second!.result.errorCode).toBeUndefined()
+        expect(JSON.stringify(second!.result.content)).toContain('deduplicated')
         expect(JSON.stringify(second!.result.content)).toContain(
           computeVersion('value'),
         )
@@ -220,7 +228,7 @@ describe('operation-level idempotency', () => {
     }
   })
 
-  test('unknown outcome (interrupted running op) refuses blind re-execution', async () => {
+  test('unknown outcome: inspectOutcome adjudicates and execution continues safely', async () => {
     const world = await makeWorld({
       mode: 'bypassPermissions',
       persist: true,
@@ -263,13 +271,22 @@ describe('operation-level idempotency', () => {
       )
       expect(completion).toBeDefined()
       if (completion!.type === 'tool.call.completed') {
-        expect(completion!.result.ok).toBe(false)
-        expect(completion!.result.errorCode).toBe('UNKNOWN_OUTCOME_REQUIRES_INSPECTION')
+        // the file never landed on disk, so the probe resolves
+        // not-applied and the runtime re-executes safely
+        expect(completion!.result.ok).toBe(true)
       }
-      // no side effect happened
-      await expect(
-        readFile(join(world.workspaceRoot, 'u.txt'), 'utf8'),
-      ).rejects.toThrow()
+      // audit fact records the adjudication running → resolved_not_applied
+      const adjudication = result.facts.find(f => f.type === 'idempotency.adjudicated')
+      expect(adjudication).toMatchObject({
+        toolName: 'Write',
+        from: 'running',
+        to: 'resolved_not_applied',
+      })
+      expect(
+        world.runtime.toolRuntime.idempotency.getStatus(opKey),
+      ).toBe('committed')
+      const content = await readFile(join(world.workspaceRoot, 'u.txt'), 'utf8')
+      expect(content).toBe('maybe')
     } finally {
       await world.cleanup()
     }

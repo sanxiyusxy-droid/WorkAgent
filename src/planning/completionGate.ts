@@ -25,6 +25,11 @@ export function evaluateCompletion(input: {
   approvedPlan?: PlanVersion
   evidence: EvidenceReceipt[]
   riskThreshold: number
+  /**
+   * receipts that no longer match the current workspace (finish-list §1.6);
+   * stale receipts cannot satisfy any acceptance criterion
+   */
+  staleEvidenceIds?: ReadonlySet<string>
 }): CompletionGateResult {
   const { state, approvedPlan, evidence } = input
   const missing: CompletionRequirement[] = []
@@ -54,12 +59,13 @@ export function evaluateCompletion(input: {
     const uncovered = requiredCriteriaWithoutEvidence(
       approvedPlan.acceptanceCriteria,
       evidence,
+      input.staleEvidenceIds,
     )
     if (uncovered.length > 0) {
       missing.push({
         kind: 'missing_evidence',
         detail:
-          `required acceptance criteria without passed evidence: ` +
+          `required acceptance criteria without fresh, kind-matched, passed evidence: ` +
           uncovered.map(c => `${c.id} ("${c.statement}")`).join(', '),
       })
     }
@@ -89,16 +95,26 @@ export function evaluateCompletion(input: {
   }
 }
 
+/**
+ * A required criterion is covered only by a receipt that is kind-matched,
+ * status 'passed' AND still fresh (finish-list §1.6): an unbound or stale
+ * test result about an older workspace cannot complete the run.
+ */
 export function requiredCriteriaWithoutEvidence(
   criteria: AcceptanceCriterion[],
   evidence: EvidenceReceipt[],
+  staleEvidenceIds?: ReadonlySet<string>,
 ): AcceptanceCriterion[] {
   return criteria
     .filter(c => c.required && c.evidenceKind !== 'manual')
     .filter(
       c =>
         !evidence.some(
-          e => e.criterionIds.includes(c.id) && e.status === 'passed',
+          e =>
+            e.criterionIds.includes(c.id) &&
+            e.status === 'passed' &&
+            e.kind === c.evidenceKind &&
+            !(staleEvidenceIds?.has(e.id) ?? false),
         ),
     )
 }

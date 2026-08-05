@@ -163,4 +163,20 @@ export const EditTool = defineTool<z.infer<typeof EditInput>, EditOutput>({
       `Edited ${output.path} (${output.replacements} replacement${output.replacements > 1 ? 's' : ''})\n` +
       `oldVersion: ${output.oldVersion}\nnewVersion: ${output.newVersion}`,
   }),
+
+  // Adjudication probe: the commit proof is the content hash of the file
+  // AFTER the edit — identical live content means the edit is still applied.
+  inspectOutcome: async (input, ctx, record) => {
+    if (!record.proof) return { applied: false, detail: 'no commit proof recorded' }
+    const check = await checkPathReal(input.path, ctx.workspaceRoot)
+    if (!check.ok) return { applied: false, detail: `path rejected: ${check.reason}` }
+    try {
+      const { version } = await readFileVersion(check.resolved)
+      return version === record.proof
+        ? { applied: true, detail: `file content matches commit proof ${record.proof}` }
+        : { applied: false, detail: 'file content differs from commit proof' }
+    } catch {
+      return { applied: false, detail: 'target file no longer exists' }
+    }
+  },
 })

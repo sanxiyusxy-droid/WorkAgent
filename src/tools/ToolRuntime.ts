@@ -156,8 +156,11 @@ export class ToolRuntime {
     }
 
     // 5a. idempotency guard for side-effecting tools.
-    // Keyed by OPERATION identity (no callId) so a retry with a fresh call
-    // id is still recognized as the same side effect.
+    // The key follows the tool's idempotency scope (finish-list §1.4):
+    // - 'operation': args-derived BUSINESS identity — a model retry with a
+    //   fresh callId is still recognized as the same side effect
+    // - 'invocation': call-level identity — only the crash-recovery replay
+    //   of the SAME call dedupes; repeating the same command later is legal
     const hasSideEffects = !tool.readOnly(parsed.data)
     let idempotencyKey: string | undefined
     if (hasSideEffects) {
@@ -172,41 +175,95 @@ export class ToolRuntime {
         })
         return
       }
-      idempotencyKey = IdempotencyLedger.computeOperationKey({
-        sessionId: req.sessionId,
-        toolName: tool.name,
-        args: parsed.data,
-      })
-      // already committed in a previous run → skip re-execution
-      if (this.idempotency.isCommitted(idempotencyKey)) {
-        yield this.completed(req, startedAt, {
-          code: 'ALREADY_COMMITTED',
-          message:
-            `this exact ${tool.name} operation was already committed ` +
-            `(proof: ${this.idempotency.getRecord(idempotencyKey)?.proof ?? 'none'}); ` +
-            'skipping re-execution to avoid a duplicate side effect',
-          retryable: false,
-          hint: 'Read the current state if you need to verify the effect.',
-        })
-        return
+      idempotencyKey =
+        tool.idempotencyScope === 'invocation'
+          ? IdempotencyLedger.computeKey({
+              sessionId: req.sessionId,
+              callId: req.call.id,
+              toolName: tool.name,
+              args: parsed.data,
+            })
+          : IdempotencyLedger.computeOperationKey({
+              sessionId: req.sessionId,
+              toolName: tool.name,
+              args: parsed.data,
+            })
+      const record = this.idempotency.getRecord(idempotencyKey)
+
+      if (record && this.idempotency.isApplied(idempotencyKey)) {
+        // The effect was committed previously. Tools with a probe RE-VERIFY
+        // the proof against live external state: if the file was edited back
+        // or the proof no longer holds, the operation becomes re-executable
+        // instead of being skipped forever.
+        if (tool.inspectOutcome) {
+          const inspection = await tool.inspectOutcome(parsed.data, ctx, record)
+          if (inspection.applied) {
+            yield this.deduplicated(req, startedAt, inspection.detail)
+            return
+          }
+          const from = this.idempotency.adjudicate(
+            idempotencyKey,
+            'resolved_not_applied',
+            inspection.detail,
+            this.deps.clock.isoNow(),
+          )
+          await this.idempotency.flush()
+          yield this.adjudicationFact(
+            req,
+            from ?? record.status,
+            'resolved_not_applied',
+            inspection.detail,
+          )
+          // proof invalidated → fall through and re-execute normally
+        } else {
+          yield this.completed(req, startedAt, {
+            code: 'ALREADY_COMMITTED',
+            message:
+              `this exact ${tool.name} operation was already committed ` +
+              `(proof: ${record.proof ?? 'none'}); ` +
+              'skipping re-execution to avoid a duplicate side effect',
+            retryable: false,
+            hint: 'Read the current state if you need to verify the effect.',
+          })
+          return
+        }
+      } else if (record && this.idempotency.needsInspection(idempotencyKey)) {
+        // interrupted previously (running/unknown): outcome uncertain.
+        // Verifiable tools adjudicate automatically via inspectOutcome;
+        // everything else still refuses blind re-execution.
+        if (tool.inspectOutcome) {
+          const inspection = await tool.inspectOutcome(parsed.data, ctx, record)
+          const to = inspection.applied ? 'resolved_applied' : 'resolved_not_applied'
+          const from = this.idempotency.adjudicate(
+            idempotencyKey,
+            to,
+            inspection.detail,
+            this.deps.clock.isoNow(),
+          )
+          await this.idempotency.flush()
+          yield this.adjudicationFact(req, from ?? record.status, to, inspection.detail)
+          if (inspection.applied) {
+            yield this.deduplicated(req, startedAt, inspection.detail)
+            return
+          }
+          // effect verified absent → safe to re-execute below
+        } else {
+          yield this.completed(req, startedAt, {
+            code: 'UNKNOWN_OUTCOME_REQUIRES_INSPECTION',
+            message:
+              `a previous attempt of this ${tool.name} operation ended with an ` +
+              'UNKNOWN outcome (interrupted mid side effect). Re-executing blindly ' +
+              'may duplicate the effect.',
+            retryable: true,
+            hint:
+              'Inspect current state first (Read/Grep/ShellReadOnly). If the effect ' +
+              'is already applied, continue without it; if not, retry with changed ' +
+              'arguments so the operation identity differs.',
+          })
+          return
+        }
       }
-      // interrupted previously (running/unknown): outcome uncertain —
-      // blind re-execution is refused, inspection must come first
-      if (this.idempotency.needsInspection(idempotencyKey)) {
-        yield this.completed(req, startedAt, {
-          code: 'UNKNOWN_OUTCOME_REQUIRES_INSPECTION',
-          message:
-            `a previous attempt of this ${tool.name} operation ended with an ` +
-            'UNKNOWN outcome (interrupted mid side effect). Re-executing blindly ' +
-            'may duplicate the effect.',
-          retryable: true,
-          hint:
-            'Inspect current state first (Read/Grep/ShellReadOnly). If the effect ' +
-            'is already applied, continue without it; if not, retry with changed ' +
-            'arguments so the operation identity differs.',
-        })
-        return
-      }
+      // unseen / resolved_not_applied / abandoned → execute normally
       // mark running before side effect begins
       this.idempotency.markRunning(
         idempotencyKey,
@@ -265,7 +322,14 @@ export class ToolRuntime {
       }
       // tool-declared facts flow back through events, never by direct mutation
       if (output.facts) {
-        for (const fact of output.facts) yield fact
+        for (const fact of output.facts) {
+          if (fact.type === 'workspace.changed') {
+            // the workspace moved on: receipts signed for the previous
+            // revision become stale (finish-list §1.6)
+            this.deps.services?.evidence?.bumpWorkspaceRevision()
+          }
+          yield fact
+        }
       }
       yield { type: 'tool.call.completed', result }
     } catch (error) {
@@ -295,6 +359,49 @@ export class ToolRuntime {
       durationMs: this.deps.clock.now() - startedAt,
     }
     return { type: 'tool.call.completed', result }
+  }
+
+  /**
+   * Successful DEDUPLICATED result (finish-list §1.4): the side effect is
+   * verified already applied, so the call succeeds instead of failing with
+   * ALREADY_COMMITTED. ok:true keeps failure counters and Replan detectors
+   * untouched.
+   */
+  private deduplicated(
+    req: ExecuteToolRequest,
+    startedAt: number,
+    detail: string,
+  ): AgentEvent {
+    const result: ToolCallResult = {
+      callId: req.call.id,
+      toolName: req.call.name,
+      ok: true,
+      content: {
+        kind: 'text',
+        text:
+          `deduplicated: this ${req.call.name} operation was already applied ` +
+          `(verified against current state: ${detail}). No side effect was repeated.`,
+      },
+      durationMs: this.deps.clock.now() - startedAt,
+    }
+    return { type: 'tool.call.completed', result }
+  }
+
+  /** Audit fact for a ledger adjudication (journal-only state transition). */
+  private adjudicationFact(
+    req: ExecuteToolRequest,
+    from: string,
+    to: string,
+    detail: string,
+  ): AgentEvent {
+    return {
+      type: 'idempotency.adjudicated',
+      toolName: req.call.name,
+      callId: req.call.id,
+      from,
+      to,
+      detail,
+    }
   }
 }
 

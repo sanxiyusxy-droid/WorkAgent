@@ -18,6 +18,12 @@ export interface CliArgs {
   session?: string
   /** resume the most recent session in the workspace */
   continueLatest: boolean
+  /**
+   * opt in to degraded recovery: skip corrupt journal facts and continue in
+   * a read-only recovery branch. Without this flag, recovery is strict and
+   * a corrupt journal refuses to resume (exit code 2).
+   */
+  allowDegraded: boolean
   debug?: boolean
   /** one-shot prompt: run it, print the answer, exit */
   print?: string
@@ -40,7 +46,7 @@ const FLAGS_WITH_VALUE = new Set([
  * so typos never silently change behavior.
  */
 export function parseArgs(argv: string[]): CliArgs {
-  const args: CliArgs = { continueLatest: false, errors: [] }
+  const args: CliArgs = { continueLatest: false, allowDegraded: false, errors: [] }
   const positionals: string[] = []
 
   for (let i = 0; i < argv.length; i++) {
@@ -114,6 +120,9 @@ export function parseArgs(argv: string[]): CliArgs {
       case '--continue':
         args.continueLatest = true
         break
+      case '--allow-degraded':
+        args.allowDegraded = true
+        break
       case '--debug':
         args.debug = true
         break
@@ -184,6 +193,8 @@ OPTIONS
   -y, --yes              shortcut for --mode acceptEdits
       --session <id>     resume a specific session
   -c, --continue         resume the most recent session that has a conversation
+      --allow-degraded   resume a corrupt journal anyway: fork a read-only
+                         recovery branch (default: strict, refuses with exit 2)
       --sessions         list resumable sessions and exit
   -p, --print <prompt>   non-interactive single turn
       --debug            show prompt manifests, permission traces, transitions

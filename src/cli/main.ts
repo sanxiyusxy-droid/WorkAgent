@@ -7,7 +7,7 @@
  * (written by `code-agent setup`), so no environment variables are needed.
  */
 import { createInterface } from 'node:readline/promises'
-import { mkdir, readdir, readFile, stat } from 'node:fs/promises'
+import { copyFile, mkdir, readdir, readFile, stat } from 'node:fs/promises'
 import process from 'node:process'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -21,8 +21,8 @@ import {
   type ModelFileConfig,
 } from '../app/config.js'
 import type { AgentMode, FactEvent, TerminalReason } from '../core/events.js'
-import { isFactEvent } from '../core/events.js'
-import { reduce, type AgentState } from '../core/state.js'
+import type { AgentState } from '../core/state.js'
+import { driveTurn } from './turnRunner.js'
 import type { ModelGateway } from '../model/types.js'
 import { OpenAICompatibleProvider } from '../model/providers/openaiCompatible.js'
 import { AnthropicProvider } from '../model/providers/anthropic.js'
@@ -33,6 +33,8 @@ import {
   removeSessionIfUnused,
   type SessionSummary,
 } from '../session/sessionIndex.js'
+import { loadSession } from '../session/SessionLoader.js'
+import { diagnoseSession, type RecoveryDiagnosis } from '../session/recoveryCheck.js'
 import { Spinner } from './spinner.js'
 import { Renderer } from './render.js'
 import { askPermission, askPlanApproval, askUserQuestion } from './prompts.js'
@@ -154,6 +156,35 @@ function printSessions(sessions: SessionSummary[], workspaceRoot: string): void 
       `\n  ${style.green('*')} = what --continue resumes · pick another with --session <id>`,
     ),
   )
+}
+
+/**
+ * Structured refusal for strict recovery (finish-list §1.5): same diagnostic
+ * shape for journal syntax/checksum errors and reducer invariant violations,
+ * the exact failing position, and the journal left untouched. Exit code 2
+ * distinguishes "refused to resume" from ordinary run failures (exit 1).
+ */
+function printRecoveryRefusal(input: {
+  sessionId: string
+  journalPath: string
+  diagnosis: RecoveryDiagnosis
+}): void {
+  console.error(rule('recovery refused (strict mode)'))
+  console.error(`  ${symbol.fail} journal replay failed — refusing to continue`)
+  console.error(`  ${style.gray('session      ')} ${input.sessionId}`)
+  console.error(`  ${style.gray('journal      ')} ${input.journalPath}`)
+  for (const issue of input.diagnosis.issues) {
+    console.error(
+      `  ${symbol.fail} [${issue.kind}] ${issue.location} — ${issue.invariant}: ${issue.message}`,
+    )
+  }
+  console.error(`  ${style.gray('last trusted ')} seq ${input.diagnosis.lastTrustedSeq}`)
+  console.error('')
+  console.error('  The corrupt journal is left untouched (nothing was rewritten or deleted).')
+  console.error(
+    `  To continue anyway, rerun with ${style.cyan('--allow-degraded')}: the agent forks a`,
+  )
+  console.error('  read-only recovery branch into a new session and keeps this journal intact.')
 }
 
 function banner(input: {
@@ -291,11 +322,42 @@ async function main(): Promise<void> {
   const continued = args.continueLatest
     ? await latestResumableSession(workspaceRoot)
     : undefined
-  const sessionId =
+  let sessionId =
     args.session ??
     process.env.AGENT_SESSION ??
     continued?.id ??
     fileConfig.sessionId
+
+  // ---- recovery preflight (strict by default, finish-list §1.5) ----
+  // Runs BEFORE createRuntime so a refused resume never appends a single
+  // envelope to the corrupt journal. Journal loader errors and reducer
+  // invariant violations share one diagnostic model.
+  let recoveryForkFrom: string | undefined
+  let degradedDiagnosis: RecoveryDiagnosis | undefined
+  if (sessionId) {
+    const probeJournalPath = join(
+      workspaceRoot,
+      '.agent',
+      'sessions',
+      sessionId,
+      'journal.jsonl',
+    )
+    const probe = await loadSession(probeJournalPath)
+    if (probe.envelopes.length > 0 || probe.diagnostics.some(d => !d.startsWith('journal not found'))) {
+      const diagnosis = diagnoseSession(probe)
+      if (!diagnosis.ok) {
+        if (!args.allowDegraded) {
+          printRecoveryRefusal({ sessionId, journalPath: probeJournalPath, diagnosis })
+          process.exit(2)
+        }
+        // degraded: fork a recovery branch into a NEW session; the corrupt
+        // source journal is never rewritten
+        degradedDiagnosis = diagnosis
+        recoveryForkFrom = sessionId
+        sessionId = undefined
+      }
+    }
+  }
 
   const policyRef: {
     current: import('../policy/PolicyEngine.js').PolicyEngine | null
@@ -320,6 +382,7 @@ async function main(): Promise<void> {
       verification: effective.verification,
       context: effective.context,
       configHash: effective.configHash,
+      recoveryForkFrom,
     },
     // non-interactive runs must never block on a keyboard prompt: permission
     // requests are auto-denied and interactive channels stay unconfigured
@@ -348,17 +411,79 @@ async function main(): Promise<void> {
   })
   policyRef.current = runtime.policy
 
+  // a recovery branch inherits the source session's idempotency ledger so
+  // already-committed side effects stay deduplicated (must precede resume)
+  if (recoveryForkFrom) {
+    const ledgerSrc = join(
+      workspaceRoot,
+      '.agent',
+      'sessions',
+      recoveryForkFrom,
+      'idempotency.json',
+    )
+    try {
+      await copyFile(ledgerSrc, join(runtime.artifactDir, 'idempotency.json'))
+    } catch {
+      // source run never wrote a ledger — nothing to inherit
+    }
+  }
+
   // ---- resume ----
   let state: AgentState = runtime.makeInitialState()
   let resumedNote: string | undefined
   if (loaded && loaded.envelopes.length > 0) {
-    const resumed = await resumeState(runtime, loaded)
+    const resumed = await resumeState(runtime, loaded, {
+      degraded: degradedDiagnosis !== undefined,
+    })
     state = resumed.state
     resumedNote =
       `${loaded.messages.length} messages` +
       (loaded.openToolCalls.length > 0
         ? `, ${loaded.openToolCalls.length} interrupted tool call(s) closed`
         : '')
+
+    if (resumed.replayFailure && !degradedDiagnosis) {
+      // defense in depth: the preflight should have caught this already;
+      // never silently replay past a corrupt fact in strict mode
+      console.error(
+        `${symbol.fail} replay failed at seq ${resumed.replayFailure.seq}` +
+          ` (${resumed.replayFailure.invariant}): ${resumed.replayFailure.message}`,
+      )
+      console.error(`  last trusted seq: ${resumed.replayFailure.lastTrustedSeq}`)
+      rl.close()
+      process.exit(2)
+    }
+
+    if (degradedDiagnosis) {
+      // degraded recovery: read-only inspection only — force plan mode so
+      // write tools are refused, and persist provenance into the NEW journal
+      state = { ...state, mode: 'plan' }
+      const branchFact: FactEvent = {
+        type: 'session.recovery.branch',
+        fromSessionId: recoveryForkFrom!,
+        failureSeq: degradedDiagnosis.lastTrustedSeq + 1,
+        issues: degradedDiagnosis.issues
+          .slice(0, 5)
+          .map(issue => `[${issue.kind}] ${issue.location} ${issue.invariant}`),
+      }
+      await runtime.journal?.append(branchFact, state.turnId, 'flush')
+      resumedNote =
+        `${resumedNote ?? ''} (degraded recovery branch from ${recoveryForkFrom}, read-only)`.trim()
+    }
+  }
+
+  if (degradedDiagnosis) {
+    renderer.warn(
+      'DEGRADED RECOVERY: corrupt facts were skipped — this branch is READ-ONLY (plan mode).',
+    )
+    for (const issue of degradedDiagnosis.issues) {
+      renderer.warn(`  untrusted: [${issue.kind}] ${issue.location} — ${issue.invariant}`)
+    }
+    renderer.plain(
+      style.gray(
+        `  source session ${recoveryForkFrom} journal left untouched; new facts go to ${runtime.sessionId}`,
+      ),
+    )
   }
 
   if (!oneShot) {
@@ -428,43 +553,17 @@ async function main(): Promise<void> {
 
     let terminal: TerminalReason | undefined
     try {
-      const run = runtime.engine.run(state, controller.signal)
-      let step = await run.next()
-      while (!step.done) {
-        const event = step.value
-        metrics.record(event)
-        renderer.handle(event)
-        if (isFactEvent(event)) {
-          if (
-            event.type === 'assistant.message.completed' ||
-            event.type === 'tool.result.message' ||
-            event.type === 'user.message.accepted'
-          ) {
-            state = { ...state, messages: [...state.messages, event.message] }
-          } else if (event.type === 'mode.changed') {
-            state = reduce(state, event)
-          } else if (event.type === 'task.changed') {
-            state = {
-              ...state,
-              tasks: [
-                ...state.tasks.filter(task => task.id !== event.task.id),
-                event.task,
-              ],
-            }
-          } else if (event.type === 'run.terminated') {
-            terminal = event.terminal
-          } else if (event.type === 'tool.call.completed') {
-            state = {
-              ...state,
-              toolResults: {
-                ...state.toolResults,
-                [event.result.callId]: event.result,
-              },
-            }
-          }
-        }
-        step = await run.next()
-      }
+      const outcome = await driveTurn(
+        runtime.engine,
+        state,
+        controller.signal,
+        event => {
+          metrics.record(event)
+          renderer.handle(event)
+        },
+      )
+      state = outcome.state
+      terminal = outcome.terminal
       renderer.finishTurn()
 
       if (debug) {

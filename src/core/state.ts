@@ -22,7 +22,8 @@ export interface RecoveryState {
   /** replan detector inputs, snapshotted so replay stays deterministic */
   consecutiveFailures: number
   versionConflicts: number
-  /** explicit replanning state: set by replan.requested, cleared by plan.approved */
+  /** explicit replanning state: set by replan.requested, cleared by
+   *  plan.approved (reapproval) or replan.adjustment.applied (low-impact) */
   replanning: boolean
   /** the pending replan needs human re-approval → write tools stay disabled */
   replanAwaitingApproval: boolean
@@ -274,6 +275,28 @@ export function reduce(state: AgentState, event: FactEvent): AgentState {
         },
       }
 
+    case 'replan.adjustment.applied': {
+      // low-impact replans close deterministically: the state machine must
+      // prove when replanning started, what changed, and when it ended
+      if (!state.recovery.replanning) {
+        throw new InvariantError(
+          'replan_adjustment_without_request',
+          'replan.adjustment.applied but no replan is in progress',
+        )
+      }
+      if (state.recovery.replanAwaitingApproval) {
+        throw new InvariantError(
+          'replan_adjustment_on_reapproval',
+          'a reapproval replan can only end via plan.approved, ' +
+            'not replan.adjustment.applied',
+        )
+      }
+      return {
+        ...state,
+        recovery: { ...state.recovery, replanning: false },
+      }
+    }
+
     case 'plan.status.changed': {
       // superseding the active plan version un-approves it: the write gate
       // stays closed until a new version is proposed and approved
@@ -301,6 +324,11 @@ export function reduce(state: AgentState, event: FactEvent): AgentState {
 
     case 'evidence.recorded':
       return { ...state, evidenceIds: [...state.evidenceIds, event.receipt.id] }
+
+    case 'idempotency.adjudicated':
+      // audit-only: the authoritative resolution lives in the persisted
+      // idempotency ledger; the fact keeps the journal self-explaining
+      return state
 
     case 'verification.completed':
       return {
@@ -389,6 +417,11 @@ export function reduce(state: AgentState, event: FactEvent): AgentState {
         workspace: { ...state.workspace, touchedFiles: touched },
       }
     }
+
+    case 'session.recovery.branch':
+      // audit-only provenance: the branch fork itself carries no state
+      // transition (the recovered state arrives via replayed facts)
+      return state
   }
 }
 
