@@ -70,8 +70,9 @@ code-agent --continue             # resume the most recent session
 code-agent sessions               # list resumable sessions
 ```
 
-Providers: any OpenAI-compatible endpoint or Anthropic. Configuration is
-picked up in this precedence order:
+Providers: any OpenAI-compatible endpoint or Anthropic (the Anthropic
+channel is implemented but not yet verified against the live API — see
+CHANGELOG). Configuration is picked up in this precedence order:
 
 ```
 environment variables > --config <file> > <workspace>/agent.config.json

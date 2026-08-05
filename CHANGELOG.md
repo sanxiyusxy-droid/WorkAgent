@@ -60,3 +60,19 @@ First release candidate of the standalone CLI code agent.
   collection from the session journal.
 - Coverage floors for correctness-critical modules (`npm run test:cov`).
 - Build embeds the source commit; `--version` reports it.
+
+### Fixed
+- Edit/ApplyPatch now match text line-ending-tolerantly: LF snippets from
+  the model match CRLF files on Windows and the file's line endings are
+  preserved (exact matches still win).
+- One-shot mode (`-p`) never blocks on keyboard prompts anymore:
+  permission requests are auto-denied with a visible note, and AskUser /
+  plan approval degrade to clear tool errors.
+- Every run now ends with a named `run.terminated` fact, even when the
+  loop throws; one-shot runs exit non-zero when they did not complete.
+
+### Provider verification status
+- v1.0 was verified end-to-end against a real model via the
+  **OpenAI-compatible channel only** (DeepSeek, eval suite 5/5 passing).
+  The Anthropic-native channel is implemented but not yet exercised
+  against the live API; treat it as untested until a contract run lands.
