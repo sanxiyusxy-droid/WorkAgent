@@ -28,7 +28,11 @@ interface TaskSpec {
   id: string
   title: string
   prompt: string
-  /** CLI mode for this task (default: acceptEdits) */
+  /**
+   * CLI mode for this task (default: bypassPermissions). Tasks run in a
+   * disposable temp workspace with a hard timeout, so the harness lets the
+   * agent self-verify via shell; a task may opt into a stricter mode.
+   */
   mode?: string
   /** per-run hard timeout in seconds (default: 300) */
   timeoutSec?: number
@@ -191,7 +195,7 @@ async function runOnce(
     const timeoutSec = spec.timeoutSec ?? 300
     const cli = await runCommand(
       `npx tsx src/cli/main.ts --dir ${JSON.stringify(workspace)} ` +
-        `--mode ${forcedMode ?? spec.mode ?? 'acceptEdits'} -p ${JSON.stringify(spec.prompt)}`,
+        `--mode ${forcedMode ?? spec.mode ?? 'bypassPermissions'} -p ${JSON.stringify(spec.prompt)}`,
       agentRoot,
       timeoutSec * 1000,
     )

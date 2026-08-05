@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path'
 import { defineTool } from '../Tool.js'
 import { checkPath, checkPathReal } from '../../policy/pathPolicy.js'
 import { computeVersion, readFileVersion } from '../../workspace/FileVersion.js'
+import { matchForReplace } from '../../workspace/lineEndings.js'
 
 const EditInput = z
   .object({
@@ -20,16 +21,6 @@ export interface EditOutput {
   oldVersion: string
   newVersion: string
   replacements: number
-}
-
-function countOccurrences(haystack: string, needle: string): number {
-  let count = 0
-  let index = haystack.indexOf(needle)
-  while (index !== -1) {
-    count += 1
-    index = haystack.indexOf(needle, index + needle.length)
-  }
-  return count
 }
 
 /**
@@ -125,25 +116,26 @@ export const EditTool = defineTool<z.infer<typeof EditInput>, EditOutput>({
       )
     }
 
-    const occurrences = countOccurrences(current.content, input.oldText)
-    if (occurrences === 0) {
+    // line-ending tolerant match: models emit LF, files on Windows are CRLF
+    const match = matchForReplace(current.content, input.oldText, input.newText)
+    if (match.occurrences === 0) {
       throw Object.assign(
         new Error('oldText not found in file. Re-read and copy the exact text.'),
         { toolErrorCode: 'SEMANTIC_VALIDATION_ERROR' },
       )
     }
-    if (!input.replaceAll && occurrences > 1) {
+    if (!input.replaceAll && match.occurrences > 1) {
       throw Object.assign(
         new Error(
-          `oldText matches ${occurrences} times; provide more context or set replaceAll=true.`,
+          `oldText matches ${match.occurrences} times; provide more context or set replaceAll=true.`,
         ),
         { toolErrorCode: 'SEMANTIC_VALIDATION_ERROR' },
       )
     }
 
     const updated = input.replaceAll
-      ? current.content.split(input.oldText).join(input.newText)
-      : current.content.replace(input.oldText, input.newText)
+      ? current.content.split(match.oldText).join(match.newText)
+      : current.content.replace(match.oldText, match.newText)
 
     // atomic write: temp file in same directory, flush, rename
     const tempPath = join(
@@ -158,7 +150,7 @@ export const EditTool = defineTool<z.infer<typeof EditInput>, EditOutput>({
         path: input.path,
         oldVersion: current.version,
         newVersion: computeVersion(updated),
-        replacements: input.replaceAll ? occurrences : 1,
+        replacements: input.replaceAll ? match.occurrences : 1,
       },
       facts: [{ type: 'workspace.changed', path: input.path, change: 'modified' }],
       commitProof: computeVersion(updated),

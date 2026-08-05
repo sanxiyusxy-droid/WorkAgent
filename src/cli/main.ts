@@ -20,7 +20,7 @@ import {
   type EffectiveConfig,
   type ModelFileConfig,
 } from '../app/config.js'
-import type { AgentMode, FactEvent } from '../core/events.js'
+import type { AgentMode, FactEvent, TerminalReason } from '../core/events.js'
 import { isFactEvent } from '../core/events.js'
 import { reduce, type AgentState } from '../core/state.js'
 import type { ModelGateway } from '../model/types.js'
@@ -301,6 +301,8 @@ async function main(): Promise<void> {
     current: import('../policy/PolicyEngine.js').PolicyEngine | null
   } = { current: null }
 
+  const oneShot = args.print !== undefined
+
   const { runtime, loaded } = await createRuntime({
     model,
     verifierModel: buildVerifierModel(fileConfig.model) ?? undefined,
@@ -319,18 +321,30 @@ async function main(): Promise<void> {
       context: effective.context,
       configHash: effective.configHash,
     },
-    askHandler: async (request, reason) =>
-      askPermission(
-        { rl, spinner, policy: policyRef.current! },
-        { tool: request.tool, input: request.input },
-        reason,
-      ),
-    channels: {
-      askUser: async input =>
-        askUserQuestion({ rl, spinner, policy: policyRef.current! }, input),
-      requestPlanApproval: async plan =>
-        askPlanApproval({ rl, spinner, policy: policyRef.current! }, plan),
-    },
+    // non-interactive runs must never block on a keyboard prompt: permission
+    // requests are auto-denied and interactive channels stay unconfigured
+    // (AskUser / plan approval degrade to clear tool errors instead)
+    askHandler: oneShot
+      ? async request => {
+          renderer.warn(
+            `permission auto-denied in -p mode: ${request.tool.name}`,
+          )
+          return 'deny'
+        }
+      : async (request, reason) =>
+          askPermission(
+            { rl, spinner, policy: policyRef.current! },
+            { tool: request.tool, input: request.input },
+            reason,
+          ),
+    channels: oneShot
+      ? {}
+      : {
+          askUser: async input =>
+            askUserQuestion({ rl, spinner, policy: policyRef.current! }, input),
+          requestPlanApproval: async plan =>
+            askPlanApproval({ rl, spinner, policy: policyRef.current! }, plan),
+        },
   })
   policyRef.current = runtime.policy
 
@@ -346,8 +360,6 @@ async function main(): Promise<void> {
         ? `, ${loaded.openToolCalls.length} interrupted tool call(s) closed`
         : '')
   }
-
-  const oneShot = args.print !== undefined
 
   if (!oneShot) {
     banner({
@@ -384,7 +396,7 @@ async function main(): Promise<void> {
   }
 
   // ---- one turn of the agent loop ----
-  const runTurn = async (prompt: string): Promise<void> => {
+  const runTurn = async (prompt: string): Promise<TerminalReason | undefined> => {
     const userMessage = runtime.makeUserMessage(
       prompt,
       state.messages.length > 0 ? state.messages[state.messages.length - 1]!.id : null,
@@ -414,6 +426,7 @@ async function main(): Promise<void> {
     }
     process.on('SIGINT', onSigint)
 
+    let terminal: TerminalReason | undefined
     try {
       const run = runtime.engine.run(state, controller.signal)
       let step = await run.next()
@@ -438,6 +451,8 @@ async function main(): Promise<void> {
                 event.task,
               ],
             }
+          } else if (event.type === 'run.terminated') {
+            terminal = event.terminal
           } else if (event.type === 'tool.call.completed') {
             state = {
               ...state,
@@ -460,16 +475,31 @@ async function main(): Promise<void> {
     } catch (error) {
       renderer.finishTurn()
       renderer.error(`run failed: ${(error as Error).message}`)
+      // every run must end with a named terminal fact — recovery and eval
+      // metrics both rely on it, so synthesize one when the loop threw
+      if (!terminal) {
+        terminal = {
+          reason: 'invariant_violation',
+          invariant: `run failed: ${(error as Error).message}`,
+        }
+        const fact: FactEvent = { type: 'run.terminated', terminal }
+        await runtime.journal?.append(fact, state.turnId, 'flush').catch(() => {})
+      }
     } finally {
       process.off('SIGINT', onSigint)
     }
+    return terminal
   }
 
   // ---- non-interactive single turn ----
   if (oneShot) {
-    await runTurn(args.print!)
+    const terminal = await runTurn(args.print!)
     spinner.stop()
     rl.close()
+    // CI and eval harnesses need a non-zero exit when the run did not complete
+    if (!terminal || (terminal.reason !== 'completed' && terminal.reason !== 'completed_with_unverified_items')) {
+      process.exitCode = 1
+    }
     return
   }
 

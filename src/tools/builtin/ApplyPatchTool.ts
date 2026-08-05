@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path'
 import { defineTool } from '../Tool.js'
 import { checkPath, checkPathReal } from '../../policy/pathPolicy.js'
 import { computeVersion } from '../../workspace/FileVersion.js'
+import { matchForReplace } from '../../workspace/lineEndings.js'
 import { InvariantError } from '../../core/messages.js'
 
 const PatchEdit = z.object({
@@ -145,16 +146,17 @@ export const ApplyPatchTool = defineTool<
           { toolErrorCode: 'FILE_VERSION_CONFLICT' },
         )
       }
-      const occurrences = current.split(edit.oldText).length - 1
-      if (occurrences === 0) {
+      // line-ending tolerant match: models emit LF, files on Windows are CRLF
+      const match = matchForReplace(current, edit.oldText, edit.newText)
+      if (match.occurrences === 0) {
         throw Object.assign(
           new Error(`oldText not found in ${edit.path}`),
           { toolErrorCode: 'SEMANTIC_VALIDATION_ERROR' },
         )
       }
-      if (!edit.replaceAll && occurrences > 1) {
+      if (!edit.replaceAll && match.occurrences > 1) {
         throw Object.assign(
-          new Error(`oldText ambiguous in ${edit.path} (${occurrences} matches)`),
+          new Error(`oldText ambiguous in ${edit.path} (${match.occurrences} matches)`),
           { toolErrorCode: 'SEMANTIC_VALIDATION_ERROR' },
         )
       }
@@ -163,8 +165,8 @@ export const ApplyPatchTool = defineTool<
         displayPath: edit.path,
         action: 'edited',
         newContent: edit.replaceAll
-          ? current.split(edit.oldText).join(edit.newText)
-          : current.replace(edit.oldText, edit.newText),
+          ? current.split(match.oldText).join(match.newText)
+          : current.replace(match.oldText, match.newText),
         backup: current,
       })
     }

@@ -80,6 +80,43 @@ describe('Edit tool', () => {
     }
   })
 
+  test('LF oldText matches a CRLF file and preserves CRLF', async () => {
+    const original = 'function sum(a, b) {\r\n  return a - b\r\n}\r\n'
+    const version = computeVersion(original)
+    const world = await makeWorld({
+      mode: 'acceptEdits',
+      files: { 'crlf.js': original },
+      turns: [
+        toolCallTurn([
+          {
+            id: 'e4',
+            name: 'Edit',
+            input: {
+              path: 'crlf.js',
+              // models emit LF even when the file on disk is CRLF
+              oldText: 'function sum(a, b) {\n  return a - b\n}',
+              newText: 'function sum(a, b) {\n  return a + b\n}',
+              expectedVersion: version,
+            },
+          },
+        ]),
+        textTurn('edited'),
+      ],
+    })
+    try {
+      const result = await collectRun(
+        world.runtime.engine,
+        await stateWithUser(world, 'fix sum'),
+      )
+      const completed = result.facts.find(f => f.type === 'tool.call.completed')
+      expect(completed).toMatchObject({ result: { ok: true } })
+      const content = await readFile(join(world.workspaceRoot, 'crlf.js'), 'utf8')
+      expect(content).toBe('function sum(a, b) {\r\n  return a + b\r\n}\r\n')
+    } finally {
+      await world.cleanup()
+    }
+  })
+
   test('ambiguous oldText rejected without replaceAll', async () => {
     const original = 'foo\nfoo\n'
     const world = await makeWorld({
