@@ -215,7 +215,7 @@ export function checkPlanConstraints(input: {
 
   // 3. required acceptance criteria must be referenced by at least one task
   const requiredCriteria = approvedPlan.acceptanceCriteria.filter(
-    c => c.required && c.evidenceKind !== 'manual',
+    c => c.required,
   )
   const coveredByTasks = new Set(tasks.flatMap(t => t.acceptanceCriteria))
   for (const criterion of requiredCriteria) {

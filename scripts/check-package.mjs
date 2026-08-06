@@ -18,13 +18,27 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)))
 // script, so letting npm pack fire lifecycle hooks would recurse infinitely
 // (and nested npm runs lose node_modules/.bin from PATH anyway). Content
 // checks only need the file list, which is identical with scripts skipped.
-const result = spawnSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], {
+// npm_execpath points at npm-cli.js when invoked through an npm lifecycle.
+// Running that file with the current Node executable avoids shell=true (and
+// Node's DEP0190 warning) while remaining portable on Windows.
+const npmCli = process.env.npm_execpath
+const npmExecutable = npmCli
+  ? process.execPath
+  : process.platform === 'win32'
+    ? (process.env.ComSpec ?? 'cmd.exe')
+    : 'npm'
+const npmArgs = npmCli
+  ? [npmCli, 'pack', '--dry-run', '--json', '--ignore-scripts']
+  : process.platform === 'win32'
+    ? ['/d', '/s', '/c', 'npm.cmd pack --dry-run --json --ignore-scripts']
+    : ['pack', '--dry-run', '--json', '--ignore-scripts']
+const result = spawnSync(npmExecutable, npmArgs, {
   cwd: root,
   encoding: 'utf8',
-  shell: true, // npm is a .cmd shim on Windows
+  shell: false,
 })
 if (result.status !== 0) {
-  console.error(`npm pack failed:\n${result.stderr}`)
+  console.error(`npm pack failed:\n${result.stderr ?? result.error?.message ?? 'unknown error'}`)
   process.exit(1)
 }
 
@@ -75,6 +89,9 @@ for (const file of files) {
       violations.push(`denylisted pattern "${pattern}" in: ${file}`)
     }
   }
+}
+for (const required of ALLOWED) {
+  if (!files.includes(required)) violations.push(`required file missing: ${required}`)
 }
 
 console.log(`package contents (${files.length} files):`)

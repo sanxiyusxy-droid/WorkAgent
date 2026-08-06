@@ -23,6 +23,11 @@ import { ShellTool, ShellReadOnlyTool } from '../tools/builtin/ShellTool.js'
 import { ApplyPatchTool } from '../tools/builtin/ApplyPatchTool.js'
 import { AskUserTool } from '../tools/builtin/AskUserTool.js'
 import {
+  DiffAssertTool,
+  FileAssertTool,
+  ManualVerifyTool,
+} from '../tools/builtin/EvidenceAssertTools.js'
+import {
   EnterPlanModeTool,
   ExitPlanModeTool,
   PlanProposeTool,
@@ -164,6 +169,9 @@ export async function createRuntime(input: {
   registry.register(ShellReadOnlyTool)
   registry.register(ApplyPatchTool)
   registry.register(AskUserTool)
+  registry.register(FileAssertTool)
+  registry.register(DiffAssertTool)
+  registry.register(ManualVerifyTool)
   registry.register(EnterPlanModeTool)
   registry.register(PlanProposeTool)
   registry.register(ExitPlanModeTool)
@@ -474,12 +482,15 @@ export async function resumeState(
   // restore the workspace revision counter from the journal so freshness
   // judgments after recovery match the pre-crash view (finish-list §1.6)
   let workspaceRevision = 0
+  const changedPaths: string[] = []
   for (const envelope of loaded.envelopes) {
-    if ((envelope.event as FactEvent).type === 'workspace.changed') {
+    const event = envelope.event as FactEvent
+    if (event.type === 'workspace.changed') {
       workspaceRevision += 1
+      changedPaths.push(event.path)
     }
   }
-  runtime.evidence.setWorkspaceRevision(workspaceRevision)
+  runtime.evidence.setWorkspaceRevision(workspaceRevision, changedPaths)
 
   // Phase 3: close orphan tool calls
   const recoveryFacts: FactEvent[] = []

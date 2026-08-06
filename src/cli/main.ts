@@ -23,6 +23,7 @@ import {
 import type { AgentMode, FactEvent, TerminalReason } from '../core/events.js'
 import type { AgentState } from '../core/state.js'
 import { driveTurn } from './turnRunner.js'
+import { IdempotencyLedgerError } from '../tools/IdempotencyLedger.js'
 import type { ModelGateway } from '../model/types.js'
 import { OpenAICompatibleProvider } from '../model/providers/openaiCompatible.js'
 import { AnthropicProvider } from '../model/providers/anthropic.js'
@@ -423,7 +424,8 @@ async function main(): Promise<void> {
     )
     try {
       await copyFile(ledgerSrc, join(runtime.artifactDir, 'idempotency.json'))
-    } catch {
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
       // source run never wrote a ledger — nothing to inherit
     }
   }
@@ -432,9 +434,19 @@ async function main(): Promise<void> {
   let state: AgentState = runtime.makeInitialState()
   let resumedNote: string | undefined
   if (loaded && loaded.envelopes.length > 0) {
-    const resumed = await resumeState(runtime, loaded, {
-      degraded: degradedDiagnosis !== undefined,
-    })
+    let resumed: Awaited<ReturnType<typeof resumeState>>
+    try {
+      resumed = await resumeState(runtime, loaded, {
+        degraded: degradedDiagnosis !== undefined,
+      })
+    } catch (error) {
+      if (!(error instanceof IdempotencyLedgerError)) throw error
+      renderer.error(`resume refused [${error.code}]: ${error.message}`)
+      renderer.warn('The idempotency ledger was not treated as empty; no tool was replayed.')
+      rl.close()
+      process.exitCode = 2
+      return
+    }
     state = resumed.state
     resumedNote =
       `${loaded.messages.length} messages` +

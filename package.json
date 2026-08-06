@@ -1,6 +1,6 @@
 {
   "name": "code-agent",
-  "version": "1.0.0-rc.2",
+  "version": "1.0.0-rc.3",
   "description": "A resumable, contract-driven CLI code agent",
   "license": "MIT",
   "type": "module",
@@ -12,7 +12,7 @@
     "dist"
   ],
   "engines": {
-    "node": ">=18.17"
+    "node": ">=20"
   },
   "scripts": {
     "cli": "tsx src/cli/main.ts",
@@ -26,6 +26,7 @@
     "check:package": "node scripts/check-package.mjs",
     "prepack": "npm run typecheck && npm test && npm run secret-scan && npm run build && npm run check:package",
     "eval": "tsx eval/run-eval.ts",
+    "smoke:anthropic": "tsx scripts/smoke-anthropic.ts",
     "precommit": "node scripts/secret-scan.mjs"
   },
   "dependencies": {

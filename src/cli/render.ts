@@ -34,6 +34,12 @@ export function summarizeToolInput(name: string, input: unknown): string {
       return oneLine(str('command') ?? '', 64)
     case 'AskUser':
       return oneLine(str('question') ?? '', 64)
+    case 'FileAssert':
+      return str('path') ?? ''
+    case 'DiffAssert':
+      return `${Array.isArray(arg.paths) ? arg.paths.length : 0} path(s)`
+    case 'ManualVerify':
+      return `${Array.isArray(arg.criterionIds) ? arg.criterionIds.length : 0} criterion/criteria`
     case 'TaskCreate':
       return oneLine(str('subject') ?? '', 48)
     case 'TaskUpdate':

@@ -5,6 +5,8 @@ import { createSequentialIds } from '../src/core/runtimePrimitives.js'
 import { fixedClock, makeWorld, collectRun, stateWithUser } from './helpers.js'
 import { textTurn, toolCallTurn } from '../src/model/ScriptedModel.js'
 import type { EvidenceReceipt } from '../src/verification/types.js'
+import { createHash } from 'node:crypto'
+import { receiptHashBody } from '../src/verification/EvidenceStore.js'
 
 function makePlanStore() {
   return new PlanStore({
@@ -144,8 +146,11 @@ describe('TaskStore invariants', () => {
       observation: { exitCode: 0, outputPreview: 'ok' },
       startedAt: 't',
       completedAt: 't',
-      sha256: 'x',
+      sha256: '',
     }
+    receipt.sha256 = createHash('sha256')
+      .update(JSON.stringify(receiptHashBody(receipt)))
+      .digest('hex')
     const withEvidence = store.update(
       { id: a.value.id, expectedRevision: 2, patch: { status: 'completed' } },
       { criteria, evidence: [receipt] },

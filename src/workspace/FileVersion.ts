@@ -1,6 +1,9 @@
 import { createHash } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 
+/** Signed marker for an assertion that observed a path as absent. */
+export const MISSING_FILE_VERSION = 'missing'
+
 /**
  * File version = sha256 of raw bytes. Used as the optimistic-concurrency
  * precondition for Edit: "I last read version X" must still hold at write

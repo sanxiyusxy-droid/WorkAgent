@@ -2,6 +2,7 @@ import type { PlanTask, TaskStatus, UpdateTaskInput } from './types.js'
 import type { EvidenceReceipt } from '../verification/types.js'
 import type { AcceptanceCriterion } from './types.js'
 import type { Clock, IdGenerator } from '../core/runtimePrimitives.js'
+import { requiredCriteriaWithoutUsableEvidence } from '../verification/criteriaEvidence.js'
 
 export type TaskStoreResult<T> =
   | { ok: true; value: T }
@@ -76,6 +77,8 @@ export class TaskStore {
     options: {
       criteria?: AcceptanceCriterion[]
       evidence?: EvidenceReceipt[]
+      staleEvidenceIds?: ReadonlySet<string>
+      workspaceRoot?: string
     } = {},
   ): TaskStoreResult<PlanTask> {
     const task = this.tasks.get(input.id)
@@ -136,12 +139,10 @@ export class TaskStore {
         const required = criteria.filter(
           c => criteriaIds.includes(c.id) && c.required,
         )
-        const missing = required.filter(
-          c =>
-            !evidence.some(
-              e => e.criterionIds.includes(c.id) && e.status === 'passed',
-            ),
-        )
+        const missing = requiredCriteriaWithoutUsableEvidence(required, evidence, {
+          staleEvidenceIds: options.staleEvidenceIds,
+          expectedWorkspaceRoot: options.workspaceRoot,
+        })
         if (missing.length > 0) {
           return {
             ok: false,

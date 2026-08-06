@@ -294,6 +294,7 @@ export class AgentEngine {
             evidence: this.d.gate.evidence?.list() ?? [],
             riskThreshold: this.d.gate.riskThreshold,
             staleEvidenceIds,
+            workspaceRoot: this.d.gate.evidence?.workspaceRoot,
           })
 
           if (gate.action === 'continue') {

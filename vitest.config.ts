@@ -24,6 +24,7 @@ export default defineConfig({
         'src/session/**': { statements: 85, lines: 85 },
         'src/verification/**': { statements: 90, lines: 90 },
         'src/context/**': { statements: 93, lines: 93 },
+        'src/model/providers/**': { statements: 85, lines: 85, branches: 70 },
       },
     },
   },

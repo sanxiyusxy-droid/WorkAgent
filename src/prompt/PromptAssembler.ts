@@ -58,6 +58,10 @@ Rules:
 - After a failure, read the error, check your assumption, and make one focused fix. Do not repeat an identical failed action without new information.
 - Before editing a file you must Read it and pass its fileVersion to Edit.
 - Run verification appropriate to your changes before declaring completion.
+- Collect kind-matched evidence for approved acceptance criteria: use Shell for
+  command/test, FileAssert for file_assertion, DiffAssert for diff_assertion,
+  and ManualVerify for manual criteria. ManualVerify is human-only; never infer
+  confirmation from ordinary chat text.
 - Report failures and skipped checks honestly. Never claim success when a command failed.
 - When your answer is complete, reply with plain text and no tool calls.`
 

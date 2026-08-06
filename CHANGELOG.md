@@ -4,7 +4,31 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
-## [1.0.0-rc.2] - 2026-07-31
+## [1.0.0-rc.3] - 2026-08-06
+
+- Required manual acceptance criteria now remain explicitly unverified until
+  backed by trusted, fresh manual evidence; task completion, the completion
+  gate and verifier share one SHA/kind/freshness/workspace policy.
+- Evidence automatically fingerprints files changed during the run, so an
+  external edit invalidates a receipt even without another Agent write fact.
+- The idempotency ledger is schema-validated and fail-closed, uses stable
+  operation keys and atomically replaces a versioned on-disk document.
+- CI enforces coverage thresholds; package metadata and package-content checks
+  are aligned with the Node 20 runtime baseline.
+- Mocked SSE contract tests cover both providers' text/tool/usage/end events
+  and stable HTTP error classification without requiring network credentials.
+- `FileAssert` signs real existence/content checks as `file_assertion`
+  evidence, including a durable missing-file binding that becomes stale if an
+  external process later creates the path.
+- `DiffAssert` signs the actual Git working-tree diff from `HEAD`, including
+  untracked files, and can require specific added or removed line snippets.
+- `ManualVerify` displays the exact approved manual criteria and signs a
+  passed receipt only after the interactive human explicitly selects Confirm;
+  headless runs and ordinary model text cannot manufacture approval.
+- Added `npm run smoke:anthropic`, a bounded live connectivity/stream check
+  that reads the normal credential configuration without printing secrets.
+
+## [1.0.0-rc.2] - 2026-08-06
 
 Closes every item of the one-shot finish list (§1.1–§1.6). After this
 release the CLI state, the release package, the replan state machine,

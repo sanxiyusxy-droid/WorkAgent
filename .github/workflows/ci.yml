@@ -7,6 +7,18 @@ on:
   pull_request:
 
 jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - name: Coverage regression gates
+        run: npm run test:cov
+
   verify:
     strategy:
       fail-fast: false

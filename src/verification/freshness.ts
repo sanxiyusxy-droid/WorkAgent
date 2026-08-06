@@ -1,6 +1,12 @@
 import type { EvidenceStore } from './EvidenceStore.js'
 import { CODE_BINDING_KINDS } from './types.js'
-import { readFileVersion } from '../workspace/FileVersion.js'
+import { MISSING_FILE_VERSION, readFileVersion } from '../workspace/FileVersion.js'
+
+function isMissing(error: unknown): boolean {
+  return error instanceof Error &&
+    'code' in error &&
+    (error as NodeJS.ErrnoException).code === 'ENOENT'
+}
 
 /**
  * Evidence freshness gate (finish-list §1.6). A receipt signed for a PREVIOUS
@@ -15,7 +21,8 @@ import { readFileVersion } from '../workspace/FileVersion.js'
  *    signing ages them. Receipts with no binding at all are stale by
  *    definition: an unbound code test can never support a PASS.
  *
- * 'manual' receipts are exempt (human observations carry their own context).
+ * Manual receipts are revision-bound too: a confirmation about an older
+ * workspace cannot approve code that changed afterward.
  */
 export async function findStaleReceipts(evidence: EvidenceStore): Promise<Set<string>> {
   const stale = new Set<string>()
@@ -33,9 +40,11 @@ export async function findStaleReceipts(evidence: EvidenceStore): Promise<Set<st
             stale.add(receipt.id)
             break
           }
-        } catch {
-          stale.add(receipt.id)
-          break
+        } catch (error) {
+          if (signedVersion !== MISSING_FILE_VERSION || !isMissing(error)) {
+            stale.add(receipt.id)
+            break
+          }
         }
       }
       continue

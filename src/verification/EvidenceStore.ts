@@ -1,9 +1,11 @@
 import { createHash } from 'node:crypto'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import type { EvidenceKind, EvidenceReceipt } from './types.js'
+import { isAbsolute, relative, resolve } from 'node:path'
+import { CODE_BINDING_KINDS, type EvidenceKind, type EvidenceReceipt } from './types.js'
 import type { Clock, IdGenerator } from '../core/runtimePrimitives.js'
 import { redactDeep } from '../security/secrets.js'
+import { readFileVersion } from '../workspace/FileVersion.js'
 
 /**
  * Evidence receipts are issued by the runtime, never by model text.
@@ -22,6 +24,7 @@ export class EvidenceStore {
    * a change can be detected as stale (finish-list §1.6).
    */
   private revision = 0
+  private readonly changedPaths = new Set<string>()
 
   constructor(
     private readonly deps: {
@@ -39,14 +42,25 @@ export class EvidenceStore {
     return this.revision
   }
 
+  get workspaceRoot(): string | undefined {
+    return this.deps.workspaceRoot
+  }
+
   /** A write tool changed the workspace: every unbound receipt ages. */
-  bumpWorkspaceRevision(): number {
+  bumpWorkspaceRevision(path?: string): number {
+    const resolved = path ? this.resolveWorkspacePath(path) : undefined
+    if (resolved) this.changedPaths.add(resolved)
     return ++this.revision
   }
 
   /** Restore the counter from journal replay (count of workspace.changed). */
-  setWorkspaceRevision(revision: number): void {
+  setWorkspaceRevision(revision: number, paths: string[] = []): void {
     this.revision = revision
+    this.changedPaths.clear()
+    for (const path of paths) {
+      const resolved = this.resolveWorkspacePath(path)
+      if (resolved) this.changedPaths.add(resolved)
+    }
   }
 
   async record(input: {
@@ -65,6 +79,10 @@ export class EvidenceStore {
     // contain credentials printed by failing processes — redact before the
     // receipt is hashed or persisted.
     input = redactDeep(input)
+    const autoFileVersions =
+      input.fileVersions === undefined && CODE_BINDING_KINDS.has(input.kind)
+        ? await this.captureChangedFileVersions()
+        : undefined
     const completedAt = this.deps.clock.isoNow()
     const receipt: EvidenceReceipt = {
       id: this.deps.ids.next('ev'),
@@ -80,7 +98,11 @@ export class EvidenceStore {
       completedAt,
       sha256: '', // filled below — the hash covers the binding fields too
       workspaceRoot: this.deps.workspaceRoot,
-      fileVersions: input.fileVersions,
+      fileVersions:
+        input.fileVersions ??
+        (autoFileVersions && Object.keys(autoFileVersions).length > 0
+          ? autoFileVersions
+          : undefined),
       workspaceRevision: input.workspaceRevision ?? this.revision,
     }
     receipt.sha256 = createHash('sha256')
@@ -123,6 +145,30 @@ export class EvidenceStore {
     } else {
       this.receipts.set(receipt.id, receipt)
     }
+  }
+
+  private resolveWorkspacePath(path: string): string | undefined {
+    const root = this.deps.workspaceRoot
+    if (!root) return undefined
+    const candidate = resolve(root, path)
+    const rel = relative(resolve(root), candidate)
+    if (rel === '..' || rel.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`) || isAbsolute(rel)) {
+      return undefined
+    }
+    return candidate
+  }
+
+  private async captureChangedFileVersions(): Promise<Record<string, string>> {
+    const versions: Record<string, string> = {}
+    for (const path of this.changedPaths) {
+      try {
+        versions[path] = (await readFileVersion(path)).version
+      } catch {
+        // Deleted or unreadable files remain covered by the workspace-revision
+        // fallback because an empty binding is not emitted.
+      }
+    }
+    return versions
   }
 }
 

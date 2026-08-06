@@ -1,9 +1,14 @@
 import type { AgentState } from '../core/state.js'
 import type { AcceptanceCriterion, PlanVersion } from './types.js'
 import type { EvidenceReceipt } from '../verification/types.js'
+import { requiredCriteriaWithoutUsableEvidence } from '../verification/criteriaEvidence.js'
 
 export interface CompletionRequirement {
-  kind: 'open_tasks' | 'missing_evidence' | 'blocked_tasks'
+  kind:
+    | 'open_tasks'
+    | 'missing_evidence'
+    | 'manual_verification_required'
+    | 'blocked_tasks'
   detail: string
 }
 
@@ -30,6 +35,8 @@ export function evaluateCompletion(input: {
    * stale receipts cannot satisfy any acceptance criterion
    */
   staleEvidenceIds?: ReadonlySet<string>
+  /** workspace in which the run is being completed */
+  workspaceRoot?: string
 }): CompletionGateResult {
   const { state, approvedPlan, evidence } = input
   const missing: CompletionRequirement[] = []
@@ -60,13 +67,24 @@ export function evaluateCompletion(input: {
       approvedPlan.acceptanceCriteria,
       evidence,
       input.staleEvidenceIds,
+      input.workspaceRoot,
     )
-    if (uncovered.length > 0) {
+    const missingManual = uncovered.filter(c => c.evidenceKind === 'manual')
+    const missingAutomated = uncovered.filter(c => c.evidenceKind !== 'manual')
+    if (missingAutomated.length > 0) {
       missing.push({
         kind: 'missing_evidence',
         detail:
           `required acceptance criteria without fresh, kind-matched, passed evidence: ` +
-          uncovered.map(c => `${c.id} ("${c.statement}")`).join(', '),
+          missingAutomated.map(c => `${c.id} ("${c.statement}")`).join(', '),
+      })
+    }
+    if (missingManual.length > 0) {
+      missing.push({
+        kind: 'manual_verification_required',
+        detail:
+          'required manual acceptance criteria still need trusted, fresh runtime evidence: ' +
+          missingManual.map(c => `${c.id} ("${c.statement}")`).join(', '),
       })
     }
   }
@@ -104,19 +122,12 @@ export function requiredCriteriaWithoutEvidence(
   criteria: AcceptanceCriterion[],
   evidence: EvidenceReceipt[],
   staleEvidenceIds?: ReadonlySet<string>,
+  workspaceRoot?: string,
 ): AcceptanceCriterion[] {
-  return criteria
-    .filter(c => c.required && c.evidenceKind !== 'manual')
-    .filter(
-      c =>
-        !evidence.some(
-          e =>
-            e.criterionIds.includes(c.id) &&
-            e.status === 'passed' &&
-            e.kind === c.evidenceKind &&
-            !(staleEvidenceIds?.has(e.id) ?? false),
-        ),
-    )
+  return requiredCriteriaWithoutUsableEvidence(criteria, evidence, {
+    staleEvidenceIds,
+    expectedWorkspaceRoot: workspaceRoot,
+  })
 }
 
 /** Risk scoring (guide §9.6): decides whether L2 verification is forced. */

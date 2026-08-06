@@ -115,17 +115,18 @@ describe('evidence freshness as a completion gate (finish-list §1.6)', () => {
     }
   })
 
-  test('manual receipts are exempt from freshness binding', async () => {
+  test('manual receipts are revision-bound and become stale after a change', async () => {
     const workspaceRoot = await mkdtemp(join(tmpdir(), 'agent-fresh-'))
     try {
       const store = makeStore(workspaceRoot)
       injectReceipt(store, {
         id: 'ev_manual',
         kind: 'manual',
-        workspaceRevision: undefined,
+        workspaceRevision: 0,
       })
-      const stale = await findStaleReceipts(store)
-      expect(stale.has('ev_manual')).toBe(false)
+      expect((await findStaleReceipts(store)).has('ev_manual')).toBe(false)
+      store.bumpWorkspaceRevision('changed.ts')
+      expect((await findStaleReceipts(store)).has('ev_manual')).toBe(true)
     } finally {
       await rm(workspaceRoot, { recursive: true, force: true })
     }
@@ -226,9 +227,14 @@ describe('evidence freshness as a completion gate (finish-list §1.6)', () => {
       const receipts = world.runtime.evidence.list()
       expect(receipts).toHaveLength(1)
       expect(receipts[0]!.workspaceRevision).toBe(1)
-      expect(receipts[0]!.fileVersions).toBeUndefined()
+      const changedFile = join(world.workspaceRoot, 'app.js')
+      expect(receipts[0]!.fileVersions).toHaveProperty(changedFile)
       // signed for the current revision: fresh
       expect((await findStaleReceipts(world.runtime.evidence)).size).toBe(0)
+      // an out-of-process edit to a file touched by the Agent invalidates it,
+      // even though no new workspace.changed event was emitted
+      await writeFile(changedFile, 'console.log(2)', 'utf8')
+      expect((await findStaleReceipts(world.runtime.evidence)).has(receipts[0]!.id)).toBe(true)
     } finally {
       await world.cleanup()
     }

@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import { defineTool } from '../tools/Tool.js'
 import type { PlanTask } from './types.js'
+import { findStaleReceipts } from '../verification/freshness.js'
 
 const TaskCreateInput = z
   .object({
@@ -119,10 +120,19 @@ export const TaskUpdateTool = defineTool<
     }
     const { id, expectedRevision, ...patch } = input
     const criteria = ctx.services.plans?.lastApproved()?.acceptanceCriteria ?? []
-    const evidence = ctx.services.evidence?.list() ?? []
+    const evidenceStore = ctx.services.evidence
+    const evidence = evidenceStore?.list() ?? []
+    const staleEvidenceIds = evidenceStore
+      ? await findStaleReceipts(evidenceStore)
+      : undefined
     const result = tasks.update(
       { id, expectedRevision, patch },
-      { criteria, evidence },
+      {
+        criteria,
+        evidence,
+        staleEvidenceIds,
+        workspaceRoot: evidenceStore?.workspaceRoot,
+      },
     )
     if (!result.ok) {
       return { data: { ok: false, code: result.code, message: result.message } }

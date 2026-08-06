@@ -25,7 +25,9 @@ user goal → plan → tool calls → independent verification → evidence rece
   version; high-impact replans lock all write tools until re-approved.
 - **Evidence chain.** Verification checks must cite acceptance criteria,
   and every receipt is hash-bound to the observed command output and file
-  versions — stale or tampered evidence is rejected.
+  versions — stale or tampered evidence is rejected. Runtime tools cover all
+  five evidence kinds: Shell (`command`/`test`), `FileAssert`, `DiffAssert`
+  and human-only `ManualVerify`.
 - **Layered context management.** Token budgeting with a conservative
   margin, structured summaries that keep goals/constraints/decisions/file
   versions, and a circuit breaker against compaction loops. Stable in
@@ -47,7 +49,7 @@ minimal — but treat your API key and workspace as sensitive regardless.
 
 ## Install
 
-Requires Node.js >= 18.17.
+Requires Node.js >= 20.
 
 ```sh
 git clone <repo-url> code-agent
@@ -101,6 +103,18 @@ File access is additionally checked against the workspace root with
 symlink/junction-aware `realpath` resolution; paths escaping the workspace
 are rejected.
 
+## Acceptance evidence
+
+- `Shell` signs real command/test exit status and can bind named files.
+- `FileAssert` checks actual file existence or content and binds the observed
+  version; an assertion that a file is absent also becomes stale if another
+  process later creates it.
+- `DiffAssert` reads the real Git working-tree diff from `HEAD`, including
+  untracked files, and can check required added/removed snippets.
+- `ManualVerify` shows approved criteria through the interactive channel. Only
+  an explicit human **Confirm** produces passed manual evidence; one-shot and
+  headless runs leave such criteria honestly unverified.
+
 ## Recovery semantics
 
 - Sessions live in `<workspace>/.agent/sessions/<id>/journal.jsonl`.
@@ -140,10 +154,11 @@ npm run test:cov      # coverage with per-module regression floors
 npm run secret-scan   # credential scan (fails on findings, even without git)
 npm run build         # bundle dist/agent.mjs, embeds the source commit
 npm run eval          # run fixture tasks against a real model (needs API key)
+npm run smoke:anthropic # bounded live Anthropic stream check (needs Anthropic config)
 ```
 
 CI runs typecheck, tests, secret scan and build on Windows, Linux and
-macOS.
+macOS, plus coverage regression gates on Node 22.
 
 ## Limitations
 
@@ -152,6 +167,9 @@ macOS.
   bounds are the hard limits enforced in-process.
 - Token counts are estimated with a conservative margin unless the
   provider returns usage; budgets are enforced on the estimate.
+- Model-call and tool-call counters are cumulative for the CLI session.
+  `maxTurns` and wall-clock time are reset for each user turn; resuming a
+  session restores the cumulative counters from the journal.
 - No MCP, plugin system, RAG, multi-agent orchestration or GUI — by
   design for v1.0.
 

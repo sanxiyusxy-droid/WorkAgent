@@ -2,6 +2,8 @@ import { z } from 'zod'
 import type { EvidenceStore } from './EvidenceStore.js'
 import type { VerificationReport } from './types.js'
 import type { AcceptanceCriterion } from '../planning/types.js'
+import { verifySha256 } from './EvidenceStore.js'
+import { receiptIsUsable, receiptSupportsCriterion } from './criteriaEvidence.js'
 
 export const VerificationReportSchema = z.object({
   verdict: z.enum(['PASS', 'FAIL', 'PARTIAL']),
@@ -74,6 +76,10 @@ export function validateReport(
     if (!store.exists(id)) {
       return { ok: false, reason: `unknown evidence: ${id}` }
     }
+    const receipt = store.get(id)!
+    if (!verifySha256(receipt)) {
+      return { ok: false, reason: `tampered evidence: ${id} failed SHA-256 validation` }
+    }
     if (staleEvidenceIds?.has(id)) {
       return {
         ok: false,
@@ -116,11 +122,12 @@ export function validateReport(
       for (const criterionId of check.criterionIds) {
         const backed = check.evidenceIds.some(evId => {
           const receipt = store.get(evId)
-          return (
-            receipt !== undefined &&
-            receipt.status === 'passed' &&
-            receipt.criterionIds.includes(criterionId)
-          )
+          if (!receipt || !receipt.criterionIds.includes(criterionId)) return false
+          const options = {
+            staleEvidenceIds,
+            expectedWorkspaceRoot: store.workspaceRoot,
+          }
+          return receiptIsUsable(receipt, options)
         })
         if (!backed) {
           return {
@@ -168,7 +175,7 @@ export function validateReport(
   if (requiredCriteria && requiredCriteria.length > 0 && report.verdict === 'PASS') {
     const coveredIds = new Set(report.checks.flatMap(c => c.criterionIds))
     const uncovered = requiredCriteria
-      .filter(c => c.required && c.evidenceKind !== 'manual')
+      .filter(c => c.required)
       .filter(c => !coveredIds.has(c.id))
     if (uncovered.length > 0) {
       return {
@@ -182,13 +189,18 @@ export function validateReport(
     // 4b. evidence-kind quality: a criterion of kind 'test' must be backed
     // by evidence signed as a test run, not by a plain command, and so on
     for (const criterion of requiredCriteria) {
-      if (!criterion.required || criterion.evidenceKind === 'manual') continue
+      if (!criterion.required) continue
       const backing = report.checks
         .filter(c => c.result === 'PASS' && c.criterionIds.includes(criterion.id))
         .flatMap(c => c.evidenceIds)
         .map(evId => store.get(evId))
         .filter((r): r is NonNullable<typeof r> => r !== undefined && r.status === 'passed')
-      const kindMatched = backing.some(r => r.kind === criterion.evidenceKind)
+      const kindMatched = backing.some(r =>
+        receiptSupportsCriterion(r, criterion, {
+          staleEvidenceIds,
+          expectedWorkspaceRoot: store.workspaceRoot,
+        }),
+      )
       if (backing.length > 0 && !kindMatched) {
         return {
           ok: false,

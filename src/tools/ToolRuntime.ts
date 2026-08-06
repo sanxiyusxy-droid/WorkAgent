@@ -326,7 +326,7 @@ export class ToolRuntime {
           if (fact.type === 'workspace.changed') {
             // the workspace moved on: receipts signed for the previous
             // revision become stale (finish-list §1.6)
-            this.deps.services?.evidence?.bumpWorkspaceRevision()
+            this.deps.services?.evidence?.bumpWorkspaceRevision(fact.path)
           }
           yield fact
         }

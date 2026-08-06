@@ -11,13 +11,14 @@ export type EvidenceKind =
  * Kinds that verify CODE BEHAVIOR (tests pass, build passes, runtime
  * behavior). They must be bound to a workspace version — a receipt with no
  * freshness binding can never support a PASS about the current workspace
- * (finish-list §1.6). 'manual' observations are exempt.
+ * (finish-list §1.6). Manual observations are revision-bound as well.
  */
 export const CODE_BINDING_KINDS: ReadonlySet<EvidenceKind> = new Set([
   'command',
   'test',
   'file_assertion',
   'diff_assertion',
+  'manual',
 ])
 
 export interface EvidenceReceipt {

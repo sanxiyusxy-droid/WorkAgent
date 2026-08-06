@@ -40,7 +40,7 @@ const result = await build({
   outfile: outFile,
   bundle: true,
   platform: 'node',
-  target: 'node18',
+  target: 'node20',
   format: 'esm',
   sourcemap: false,
   minify: false, // keep stack traces readable; size is not a constraint here
