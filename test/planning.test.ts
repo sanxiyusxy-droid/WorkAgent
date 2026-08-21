@@ -229,6 +229,42 @@ describe('plan mode capability projection', () => {
 })
 
 describe('plan mode E2E flow', () => {
+  test.each([
+    ['workspace escape', '../outside.ts'],
+    ['empty file identity', ''],
+  ])('PlanPropose rejects %s', async (_case, invalidPath) => {
+    const world = await makeWorld({
+      intelligence: { enabled: false },
+      turns: [
+        toolCallTurn([{
+          id: 'bad_plan',
+          name: 'PlanPropose',
+          input: {
+            goal: 'escape the workspace',
+            steps: [{ id: 's1', title: 'bad scope', files: [invalidPath] }],
+          },
+        }]),
+        textTurn('the invalid plan was not persisted'),
+      ],
+    })
+    try {
+      const result = await collectRun(
+        world.runtime.engine,
+        await stateWithUser(world, 'make a plan'),
+      )
+      const completed = result.facts.find(
+        fact => fact.type === 'tool.call.completed' && fact.result.callId === 'bad_plan',
+      )
+      expect(completed).toMatchObject({
+        result: { ok: false, errorCode: 'SEMANTIC_VALIDATION_ERROR' },
+      })
+      expect(result.facts.some(fact => fact.type === 'plan.version.created')).toBe(false)
+      expect(world.runtime.plans.latest('plan_1')).toBeUndefined()
+    } finally {
+      await world.cleanup()
+    }
+  })
+
   test('enter plan -> propose -> approve -> mode restored', async () => {
     const approvalsSeen: string[] = []
     const world = await makeWorld({

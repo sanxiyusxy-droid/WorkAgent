@@ -1,5 +1,5 @@
 /**
- * Offline evaluation harness (finish-list §7).
+ * Live-model evaluation harness (finish-list §7).
  *
  * Runs every fixture task in eval/tasks/ against the real CLI in one-shot
  * mode and records the metrics the project reports: task success, terminal
@@ -95,20 +95,24 @@ function runCommand(
   command: string,
   cwd: string,
   timeoutMs: number,
-): Promise<{ exitCode: number | null; output: string }> {
+): Promise<{ exitCode: number | null; output: string; timedOut: boolean }> {
   return new Promise(resolvePromise => {
     const child = spawn(command, { cwd, shell: true, windowsHide: true })
     let output = ''
+    let timedOut = false
     child.stdout?.on('data', d => (output += String(d)))
     child.stderr?.on('data', d => (output += String(d)))
-    const timer = setTimeout(() => child.kill('SIGKILL'), timeoutMs)
+    const timer = setTimeout(() => {
+      timedOut = true
+      child.kill('SIGKILL')
+    }, timeoutMs)
     child.on('close', code => {
       clearTimeout(timer)
-      resolvePromise({ exitCode: code, output })
+      resolvePromise({ exitCode: code, output, timedOut })
     })
     child.on('error', () => {
       clearTimeout(timer)
-      resolvePromise({ exitCode: null, output })
+      resolvePromise({ exitCode: null, output, timedOut })
     })
   })
 }
@@ -200,8 +204,12 @@ async function runOnce(
       timeoutSec * 1000,
     )
     record.durationMs = Date.now() - startedAt
-    if (cli.exitCode === null) {
+    if (cli.timedOut) {
       record.error = `CLI timed out after ${timeoutSec}s`
+    } else if (cli.exitCode !== 0) {
+      record.error =
+        `CLI exited with ${cli.exitCode ?? 'no exit code'}: ` +
+        cli.output.slice(-400)
     }
 
     Object.assign(record, await journalMetrics(workspace))
@@ -216,7 +224,14 @@ async function runOnce(
         )
       }
     }
-    record.success = record.verifyFailed.length === 0
+    // A fixture is successful only when the process, Agent protocol and
+    // external verifier all agree. Passing checks on an unchanged workspace
+    // can no longer hide a timeout, crash or non-completion terminal.
+    record.success =
+      cli.exitCode === 0 &&
+      !cli.timedOut &&
+      record.agentCompleted &&
+      record.verifyFailed.length === 0
   } catch (error) {
     record.error = error instanceof Error ? error.message : String(error)
   } finally {
@@ -228,8 +243,15 @@ async function runOnce(
 function percentile(values: number[], p: number): number {
   if (values.length === 0) return 0
   const sorted = [...values].sort((a, b) => a - b)
-  const index = Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length))
-  return sorted[index]!
+  const position = Math.min(
+    sorted.length - 1,
+    Math.max(0, (p / 100) * (sorted.length - 1)),
+  )
+  const lower = Math.floor(position)
+  const upper = Math.ceil(position)
+  if (lower === upper) return sorted[lower]!
+  const weight = position - lower
+  return Math.round(sorted[lower]! * (1 - weight) + sorted[upper]! * weight)
 }
 
 async function main(): Promise<void> {
@@ -245,7 +267,7 @@ async function main(): Promise<void> {
   const records: RunRecord[] = []
   for (const spec of specs) {
     for (let run = 1; run <= flags.runs; run++) {
-      process.stdout.write(`▸ ${spec.id} (${spec.title}) run ${run}/${flags.runs} ... `)
+      process.stdout.write(`[run] ${spec.id} (${spec.title}) ${run}/${flags.runs} ... `)
       const record = await runOnce(spec, run, flags.mode)
       records.push(record)
       console.log(
@@ -280,12 +302,8 @@ async function main(): Promise<void> {
     resultsDir,
     `eval-${new Date().toISOString().replace(/[:.]/g, '-')}.json`,
   )
-  try {
-    await mkdir(resultsDir, { recursive: true })
-    await writeFile(outPath, JSON.stringify(summary, null, 2), 'utf8')
-  } catch {
-    // results dir is best-effort; the console table is the primary output
-  }
+  await mkdir(resultsDir, { recursive: true })
+  await writeFile(outPath, JSON.stringify(summary, null, 2), 'utf8')
 
   console.log('\n=== evaluation summary ===')
   console.log(`task success:      ${(summary.taskSuccessRate * 100).toFixed(1)}% (${succeeded.length}/${records.length})`)

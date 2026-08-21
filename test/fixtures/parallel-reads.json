@@ -16,6 +16,7 @@
     { "text": "Read both files; the Bogus tool does not exist." }
   ],
   "expectedTrace": [
+    "plan.health.assessed",
     "assistant.message.completed",
     "tool.call.accepted:c1",
     "tool.call.accepted:c2",

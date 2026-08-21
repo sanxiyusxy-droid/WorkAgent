@@ -10,6 +10,7 @@ const TaskCreateInput = z
     activeForm: z.string().optional(),
     dependsOn: z.array(z.string()).default([]),
     acceptanceCriteria: z.array(z.string()).default([]),
+    stepId: z.string().min(1).optional(),
   })
   .strict()
 
@@ -30,6 +31,23 @@ export const TaskCreateTool = defineTool<
   resources: () => [{ resource: 'state:tasks', mode: 'write' }],
   permission: async () => ({ behavior: 'allow' }),
 
+  validate: async (input, ctx) => {
+    if (!input.stepId) return { ok: true }
+    const plan = ctx.services.plans?.lastApproved()
+    if (!plan?.steps.some(step => step.id === input.stepId)) {
+      return {
+        ok: false,
+        error: {
+          code: 'SEMANTIC_VALIDATION_ERROR',
+          message: `stepId ${input.stepId} is not in the approved plan`,
+          retryable: true,
+          hint: 'Use a step id from the current approved plan.',
+        },
+      }
+    }
+    return { ok: true }
+  },
+
   execute: async (input, ctx) => {
     const tasks = ctx.services.tasks
     if (!tasks) {
@@ -40,6 +58,7 @@ export const TaskCreateTool = defineTool<
       ...input,
       planId: plan?.planId,
       planVersion: plan?.version,
+      stepId: input.stepId,
     })
     if (!result.ok) {
       return { data: { ok: false, code: result.code, message: result.message } }
@@ -180,6 +199,7 @@ export const TaskListTool = defineTool<
             .map(
               t =>
                 `${t.id} [${t.status}] rev=${t.revision} "${t.subject}"` +
+                (t.stepId ? ` step=${t.stepId}` : '') +
                 (t.dependsOn.length > 0 ? ` deps=${t.dependsOn.join(',')}` : '') +
                 (t.evidenceIds.length > 0 ? ` evidence=${t.evidenceIds.join(',')}` : '') +
                 (t.blockedReason ? ` blocked: ${t.blockedReason}` : ''),

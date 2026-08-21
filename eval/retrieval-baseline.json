@@ -1,0 +1,8 @@
+{
+  "minRecallAtK": 0.8,
+  "minMrr": 0.75,
+  "minGraphExpansionHitRate": 1,
+  "minCitationIntegrity": 1,
+  "maxStaleHitRate": 0,
+  "maxEstimatedContextTokens": 8000
+}

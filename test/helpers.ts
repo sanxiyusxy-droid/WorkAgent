@@ -44,6 +44,9 @@ export async function makeWorld(options: {
   channels?: RuntimeChannels
   verification?: RuntimeConfig['verification']
   context?: RuntimeConfig['context']
+  intelligence?: RuntimeConfig['intelligence']
+  replan?: RuntimeConfig['replan']
+  retrieval?: RuntimeConfig['retrieval']
 }): Promise<TestWorld> {
   const workspaceRoot =
     options.workspaceRoot ?? (await mkdtemp(join(tmpdir(), 'agent-test-')))
@@ -66,6 +69,9 @@ export async function makeWorld(options: {
       rules: options.rules,
       verification: options.verification,
       context: options.context,
+      intelligence: options.intelligence,
+      replan: options.replan,
+      retrieval: options.retrieval,
     },
     askHandler: options.askHandler,
     channels: options.channels,

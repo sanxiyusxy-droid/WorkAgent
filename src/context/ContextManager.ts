@@ -53,6 +53,7 @@ export function estimateTokens(messages: ConversationMessage[]): number {
           break
         case 'tool_result':
           chars += renderText(block.content).length + 20
+          chars += block.observation ? JSON.stringify(block.observation).length : 0
           break
       }
     }
@@ -66,7 +67,10 @@ export function availableForMessages(config: ContextBudgetConfig): number {
 }
 
 /** Tool results that can be re-fetched are the only micro-compact targets. */
-const REFETCHABLE_TOOLS = new Set(['Read', 'Grep', 'Glob', 'Shell', 'ShellReadOnly'])
+const REFETCHABLE_TOOLS = new Set([
+  'Read', 'Grep', 'Glob', 'Shell', 'ShellReadOnly',
+  'CodeSymbols', 'FindReferences', 'CallGraph', 'CodeDiagnostics',
+])
 
 const SUMMARY_PROMPT = `Summarize the conversation so far for a coding agent that will continue the work. Output plain text with these sections, precise and complete:
 
@@ -292,6 +296,10 @@ export class ContextManager {
             kind: 'text' as const,
             text: `[Old tool result cleared to save context: callId=${block.callId}, ${rendered.length} chars. Re-run the tool if needed; the original is in the session journal.]`,
           },
+          // The complete structured observation is also re-fetchable and
+          // remains in the journal. Keeping it on every cleared result would
+          // make long sessions grow linearly even after output compaction.
+          observation: undefined,
         }
       })
       const changed = blocks.some((b, i) => b !== message.content[i])

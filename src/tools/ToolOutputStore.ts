@@ -87,6 +87,19 @@ export function renderText(content: ToolResultContent): string {
   }
 }
 
+/** Provider-facing envelope. Contract observations stay structured instead
+ * of forcing the model to scrape a human-oriented serializer. */
+export function renderModelToolResult(input: {
+  content: ToolResultContent
+  observation?: import('../core/messages.js').ToolObservation
+}): string {
+  if (!input.observation) return renderText(input.content)
+  return JSON.stringify({
+    observation: input.observation,
+    output: renderText(input.content),
+  })
+}
+
 function sanitizeFileName(name: string): string {
   return name.replace(/[^a-zA-Z0-9_-]/g, '_')
 }

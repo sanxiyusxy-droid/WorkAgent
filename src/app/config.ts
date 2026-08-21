@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path'
 import type { AgentMode } from '../core/events.js'
 import type { PermissionRule } from '../policy/PolicyEngine.js'
 import type { ContextBudgetConfig } from '../context/ContextManager.js'
+import type { ReplanConfig } from '../planning/ReplanDetector.js'
 
 /** One overridable configuration layer. All fields optional. */
 export interface ConfigLayer {
@@ -22,6 +23,25 @@ export interface ConfigLayer {
     maxRepairAttempts?: number
   }
   context?: Partial<ContextBudgetConfig> & { enabled?: boolean }
+  intelligence?: {
+    enabled?: boolean
+    reflectionInterval?: number
+    reflectionEvaluationWindow?: number
+    completionReflection?: boolean
+    outcomeCalibrationEnabled?: boolean
+    outcomeCalibrationMinSamples?: number
+    outcomeCalibrationMaxSessions?: number
+  }
+  replan?: Partial<ReplanConfig>
+  retrieval?: {
+    enabled?: boolean
+    refreshOnSearch?: boolean
+    maxFiles?: number
+    maxFileBytes?: number
+    maxChunks?: number
+    maxPerFile?: number
+    diversityLambda?: number
+  }
 }
 
 export interface ConfigLayers {
@@ -50,6 +70,25 @@ export interface EffectiveConfig {
     maxRepairAttempts: number
   }
   context: Partial<ContextBudgetConfig> & { enabled?: boolean }
+  intelligence: {
+    enabled: boolean
+    reflectionInterval: number
+    reflectionEvaluationWindow: number
+    completionReflection: boolean
+    outcomeCalibrationEnabled: boolean
+    outcomeCalibrationMinSamples: number
+    outcomeCalibrationMaxSessions: number
+  }
+  replan: Partial<ReplanConfig>
+  retrieval: {
+    enabled: boolean
+    refreshOnSearch: boolean
+    maxFiles: number
+    maxFileBytes: number
+    maxChunks: number
+    maxPerFile: number
+    diversityLambda: number
+  }
   /** sha256 of the effective config — written into run.started */
   configHash: string
 }
@@ -63,6 +102,25 @@ const DEFAULTS = {
   maxOutputTokens: 4096,
   verification: { enabled: true, riskThreshold: 5, maxRepairAttempts: 1 },
   context: {} as EffectiveConfig['context'],
+  intelligence: {
+    enabled: true,
+    reflectionInterval: 8,
+    reflectionEvaluationWindow: 3,
+    completionReflection: false,
+    outcomeCalibrationEnabled: true,
+    outcomeCalibrationMinSamples: 3,
+    outcomeCalibrationMaxSessions: 50,
+  },
+  replan: {} as Partial<ReplanConfig>,
+  retrieval: {
+    enabled: true,
+    refreshOnSearch: true,
+    maxFiles: 20_000,
+    maxFileBytes: 1_000_000,
+    maxChunks: 60_000,
+    maxPerFile: 3,
+    diversityLambda: 0.75,
+  },
 }
 
 /**
@@ -114,6 +172,41 @@ export function mergeConfig(layers: ConfigLayers): EffectiveConfig {
     ...(layers.managed?.context ?? {}),
   }
 
+  const intelligence = {
+    ...DEFAULTS.intelligence,
+    ...(layers.user?.intelligence ?? {}),
+    ...(layers.project?.intelligence ?? {}),
+    ...(layers.cli?.intelligence ?? {}),
+    ...(layers.managed?.intelligence ?? {}),
+  }
+  intelligence.outcomeCalibrationMinSamples = clampInteger(
+    intelligence.outcomeCalibrationMinSamples,
+    1,
+    100,
+    DEFAULTS.intelligence.outcomeCalibrationMinSamples,
+  )
+  intelligence.outcomeCalibrationMaxSessions = clampInteger(
+    intelligence.outcomeCalibrationMaxSessions,
+    1,
+    500,
+    DEFAULTS.intelligence.outcomeCalibrationMaxSessions,
+  )
+
+  const replan = {
+    ...(layers.user?.replan ?? {}),
+    ...(layers.project?.replan ?? {}),
+    ...(layers.cli?.replan ?? {}),
+    ...(layers.managed?.replan ?? {}),
+  }
+
+  const retrieval = {
+    ...DEFAULTS.retrieval,
+    ...(layers.user?.retrieval ?? {}),
+    ...(layers.project?.retrieval ?? {}),
+    ...(layers.cli?.retrieval ?? {}),
+    ...(layers.managed?.retrieval ?? {}),
+  }
+
   const effective: Omit<EffectiveConfig, 'configHash'> = {
     mode: pick('mode') ?? DEFAULTS.mode,
     maxTurns: pick('maxTurns') ?? DEFAULTS.maxTurns,
@@ -125,6 +218,9 @@ export function mergeConfig(layers: ConfigLayers): EffectiveConfig {
     rules: [...managedDenies, ...otherRules],
     verification,
     context,
+    intelligence,
+    replan,
+    retrieval,
   }
 
   return {
@@ -134,6 +230,16 @@ export function mergeConfig(layers: ConfigLayers): EffectiveConfig {
       .digest('hex')
       .slice(0, 16),
   }
+}
+
+function clampInteger(
+  value: number | undefined,
+  min: number,
+  max: number,
+  fallback: number,
+): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback
+  return Math.max(min, Math.min(max, Math.round(value)))
 }
 
 /** Load `agent.config.json` from the workspace root, if present. */

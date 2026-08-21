@@ -1,5 +1,10 @@
 import { readFile } from 'node:fs/promises'
-import type { FactEvent, StateSnapshot } from '../core/events.js'
+import {
+  isFactEvent,
+  type AgentEvent,
+  type FactEvent,
+  type StateSnapshot,
+} from '../core/events.js'
 import type { ConversationMessage, ToolCall, ToolCallResult } from '../core/messages.js'
 import type { PlanTask, PlanVersion } from '../planning/types.js'
 import type { EvidenceReceipt } from '../verification/types.js'
@@ -16,6 +21,8 @@ export interface LoadedSession {
   /** accepted tool calls that never received a terminal result */
   openToolCalls: ToolCall[]
   completedResults: ToolCallResult[]
+  /** completed calls whose provider-facing tool_result message was not durable */
+  unmessagedResults: ToolCallResult[]
   /** latest snapshot of each task/evidence/plan seen in the journal */
   tasks: PlanTask[]
   evidence: EvidenceReceipt[]
@@ -40,7 +47,11 @@ export async function loadSession(filePath: string): Promise<LoadedSession> {
   let raw: string
   try {
     raw = await readFile(filePath, 'utf8')
-  } catch {
+  } catch (error) {
+    // Only a genuinely absent journal means "start fresh". Permission and
+    // I/O errors must surface; treating them as an empty session could append
+    // a new history beside data that merely became unreadable.
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     return {
       ok: true,
       diagnostics: ['journal not found; starting fresh'],
@@ -50,6 +61,7 @@ export async function loadSession(filePath: string): Promise<LoadedSession> {
       messages: [],
       openToolCalls: [],
       completedResults: [],
+      unmessagedResults: [],
       tasks: [],
       evidence: [],
       plans: [],
@@ -81,9 +93,31 @@ export async function loadSession(filePath: string): Promise<LoadedSession> {
       )
       break
     }
+    const parsedTimestamp = Date.parse(envelope.timestamp)
+    if (
+      typeof envelope.timestamp !== 'string' ||
+      !Number.isFinite(parsedTimestamp) ||
+      new Date(parsedTimestamp).toISOString() !== envelope.timestamp
+    ) {
+      diagnostics.push(
+        `line ${lineNo + 1}: invalid envelope timestamp - stopping replay here`,
+      )
+      break
+    }
     const { checksum, ...rest } = envelope
     if (envelopeChecksum(rest) !== checksum) {
       diagnostics.push(`line ${lineNo + 1}: checksum mismatch — stopping replay here`)
+      break
+    }
+    const event = (envelope as { event?: unknown }).event
+    if (
+      !event ||
+      typeof event !== 'object' ||
+      !isFactEvent(event as AgentEvent)
+    ) {
+      diagnostics.push(
+        `line ${lineNo + 1}: unknown fact event type - stopping replay here`,
+      )
       break
     }
     envelopes.push(envelope)
@@ -94,6 +128,7 @@ export async function loadSession(filePath: string): Promise<LoadedSession> {
   const messages: ConversationMessage[] = []
   const accepted = new Map<string, ToolCall>()
   const completedResults: ToolCallResult[] = []
+  const messagedResultIds = new Set<string>()
   const taskMap = new Map<string, PlanTask>()
   const evidenceMap = new Map<string, EvidenceReceipt>()
   const planMap = new Map<string, PlanVersion>()
@@ -108,8 +143,13 @@ export async function loadSession(filePath: string): Promise<LoadedSession> {
     switch (event.type) {
       case 'user.message.accepted':
       case 'assistant.message.completed':
+        messages.push(event.message)
+        break
       case 'tool.result.message':
         messages.push(event.message)
+        for (const block of event.message.content) {
+          if (block.type === 'tool_result') messagedResultIds.add(block.callId)
+        }
         break
       case 'tool.call.accepted':
         accepted.set(event.call.id, event.call)
@@ -161,6 +201,30 @@ export async function loadSession(filePath: string): Promise<LoadedSession> {
     }
   }
 
+  // Crash reconciliation: assistant.message.completed is the durable source
+  // of the whole requested batch. If the process stopped after persisting
+  // only a prefix of tool.call.accepted facts, synthesize the missing
+  // lifecycle entries as open calls so resume emits paired INTERRUPTED
+  // results for every tool_call block. No missing call is executed.
+  const terminalCallIds = new Set(completedResults.map(result => result.callId))
+  for (const message of messages) {
+    if (message.role !== 'assistant') continue
+    let receivedIndex = 0
+    for (const block of message.content) {
+      if (block.type !== 'tool_call') continue
+      if (!terminalCallIds.has(block.id) && !accepted.has(block.id)) {
+        accepted.set(block.id, {
+          id: block.id,
+          name: block.name,
+          input: block.input,
+          parentMessageId: message.id,
+          receivedIndex,
+        })
+      }
+      receivedIndex += 1
+    }
+  }
+
   // compute tail: events after the last snapshot for reducer replay
   const tailStartIndex = snapshotEnvelopeIndex >= 0 ? snapshotEnvelopeIndex + 1 : 0
   const tailEvents: FactEvent[] = []
@@ -177,6 +241,9 @@ export async function loadSession(filePath: string): Promise<LoadedSession> {
     messages,
     openToolCalls: [...accepted.values()],
     completedResults,
+    unmessagedResults: completedResults.filter(
+      result => !messagedResultIds.has(result.callId),
+    ),
     tasks: [...taskMap.values()],
     evidence: [...evidenceMap.values()],
     plans: [...planMap.values()],

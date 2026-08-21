@@ -8,6 +8,8 @@ import { diagnoseSession } from '../src/session/recoveryCheck.js'
 import { resumeState } from '../src/app/createRuntime.js'
 import type { FactEvent } from '../src/core/events.js'
 import { makeWorld } from './helpers.js'
+import { createInitialState, createSnapshot } from '../src/core/state.js'
+import type { PlanHealthAssessment } from '../src/core/events.js'
 
 const SESSION_ID = 'ses-corrupt'
 
@@ -86,6 +88,55 @@ function humanTexts(state: { messages: { meta?: { source?: string }; content: { 
 }
 
 describe('recovery strictness (finish-list §1.5)', () => {
+  test('malformed V4 snapshot is diagnosed instead of escaping as an exception', async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), 'agent-strict-'))
+    try {
+      const dir = join(workspaceRoot, '.agent', 'sessions', SESSION_ID)
+      await mkdir(dir, { recursive: true })
+      const state = createInitialState({
+        sessionId: SESSION_ID, runId: 'run_test', turnId: 'turn_test',
+        workspaceRoot, now: 0,
+        budget: { maxTurns: 1, maxModelCalls: 1, maxToolCalls: 1, maxWallTimeMs: 1 },
+      })
+      state.latestPlanHealth = {
+        id: 'health_bad', createdAt: 't', status: 'attention', score: 50,
+        signature: 'bad',
+        metrics: {
+          totalTasks: 0, completedTasks: 0, openTasks: 0, blockedTasks: 0,
+          failedTasks: 0, readyTasks: 0, requiredCriteria: 0,
+          coveredCriteria: 0, scopeDriftFiles: 0, budgetRemainingRatio: 1,
+          consecutiveFailures: 0, stagnationSignals: 0,
+          ineffectiveReflections: 0,
+        },
+        findings: [],
+        decision: {
+          action: 'future_action', rationale: 'bad', successSignals: [],
+        },
+      } as unknown as PlanHealthAssessment
+      const envelopes = [
+        envelope(1, { type: 'run.started', runId: 'run_test', configHash: 'h' }, null),
+        envelope(2, {
+          type: 'state.snapshot', snapshot: createSnapshot(state, 1),
+        }, 'evt_test_1'),
+      ]
+      const journalPath = join(dir, 'journal.jsonl')
+      await writeFile(
+        journalPath,
+        envelopes.map(item => JSON.stringify(item)).join('\n') + '\n',
+        'utf8',
+      )
+      const diagnosis = diagnoseSession(await loadSession(journalPath), workspaceRoot)
+      expect(diagnosis.ok).toBe(false)
+      expect(diagnosis.issues[0]).toMatchObject({
+        kind: 'reducer', invariant: 'plan_health_unknown_action',
+      })
+      expect(diagnosis.issues[0]!.location).toContain('seq 2')
+      expect(diagnosis.lastTrustedSeq).toBe(1)
+    } finally {
+      await rm(workspaceRoot, { recursive: true, force: true })
+    }
+  })
+
   test('diagnoseSession reports reducer invariant violations with the exact position', async () => {
     const workspaceRoot = await mkdtemp(join(tmpdir(), 'agent-strict-'))
     try {
@@ -93,7 +144,7 @@ describe('recovery strictness (finish-list §1.5)', () => {
       const loaded = await loadSession(journalPath)
       expect(loaded.ok).toBe(true) // loader sees nothing wrong
 
-      const diagnosis = diagnoseSession(loaded)
+      const diagnosis = diagnoseSession(loaded, workspaceRoot)
       expect(diagnosis.ok).toBe(false)
       expect(diagnosis.issues).toHaveLength(1)
       expect(diagnosis.issues[0]!.kind).toBe('reducer')
@@ -118,7 +169,7 @@ describe('recovery strictness (finish-list §1.5)', () => {
         'utf8',
       )
       const loaded = await loadSession(join(dir, 'journal.jsonl'))
-      const diagnosis = diagnoseSession(loaded)
+      const diagnosis = diagnoseSession(loaded, workspaceRoot)
       expect(diagnosis.ok).toBe(false)
       expect(diagnosis.issues[0]!.kind).toBe('journal')
       expect(diagnosis.issues[0]!.invariant).toBe('checksum_mismatch')
@@ -163,6 +214,34 @@ describe('recovery strictness (finish-list §1.5)', () => {
     }
   })
 
+  test('diagnosis replays absolute workspace paths against the real root', async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), 'agent-strict-root-'))
+    try {
+      const dir = join(workspaceRoot, '.agent', 'sessions', SESSION_ID)
+      await mkdir(dir, { recursive: true })
+      const envelopes = [
+        envelope(1, { type: 'run.started', runId: 'r', configHash: 'h' }, null),
+        envelope(2, {
+          type: 'workspace.changed',
+          path: join(workspaceRoot, 'src', 'absolute.ts'),
+          change: 'modified',
+        }, 'evt_test_1'),
+      ]
+      const journalPath = join(dir, 'journal.jsonl')
+      await writeFile(
+        journalPath,
+        envelopes.map(item => JSON.stringify(item)).join('\n') + '\n',
+        'utf8',
+      )
+      const loaded = await loadSession(journalPath)
+      expect(diagnoseSession(loaded, workspaceRoot).ok).toBe(true)
+      expect(diagnoseSession(loaded, join(workspaceRoot, 'other')).issues[0])
+        .toMatchObject({ invariant: 'workspace_change_outside_root' })
+    } finally {
+      await rm(workspaceRoot, { recursive: true, force: true })
+    }
+  })
+
   test('a clean journal diagnoses ok and resumes identically in both modes', async () => {
     const workspaceRoot = await mkdtemp(join(tmpdir(), 'agent-strict-'))
     try {
@@ -183,7 +262,7 @@ describe('recovery strictness (finish-list §1.5)', () => {
         'utf8',
       )
       const loaded = await loadSession(journalPath)
-      expect(diagnoseSession(loaded).ok).toBe(true)
+      expect(diagnoseSession(loaded, workspaceRoot).ok).toBe(true)
 
       const world = await makeWorld({ turns: [], persist: false, workspaceRoot })
       try {

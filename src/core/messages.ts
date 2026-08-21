@@ -33,6 +33,7 @@ export type ContentBlock =
       ok: boolean
       content: ToolResultContent
       errorCode?: string
+      observation?: ToolObservation
     }
 
 export interface ConversationMessage {
@@ -69,14 +70,37 @@ export interface ToolCallResult {
   errorCode?: string
   durationMs: number
   synthetic?: boolean
+  /**
+   * Machine-readable result of the tool contract. Unlike the rendered
+   * content, this stays small and stable so loop policy can reason about
+   * success without scraping prose.
+   */
+  observation?: ToolObservation
+}
+
+export interface ToolContractCheck {
+  id: string
+  passed: boolean
+  detail?: string
+}
+
+export interface ToolObservation {
+  summary: string
+  preconditions: ToolContractCheck[]
+  postconditions: ToolContractCheck[]
+  /** Small, tool-specific facts intended for policy/replanning code. */
+  fields?: Record<string, unknown>
 }
 
 /** Stable machine-readable tool error codes. */
 export type ToolErrorCode =
   | 'UNKNOWN_TOOL'
   | 'TOOL_NOT_AVAILABLE_IN_MODE'
+  | 'TOOL_NOT_AVAILABLE_FOR_ACTION'
   | 'INPUT_VALIDATION_ERROR'
   | 'SEMANTIC_VALIDATION_ERROR'
+  | 'PRECONDITION_FAILED'
+  | 'POSTCONDITION_FAILED'
   | 'PERMISSION_DENIED'
   | 'PERMISSION_REQUIRED'
   | 'TOOL_ABORTED'

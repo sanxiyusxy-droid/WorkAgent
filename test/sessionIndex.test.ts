@@ -12,6 +12,8 @@ import { createSequentialIds } from '../src/core/runtimePrimitives.js'
 import type { Clock } from '../src/core/runtimePrimitives.js'
 import type { ConversationMessage } from '../src/core/messages.js'
 import type { FactEvent } from '../src/core/events.js'
+import { emptyOutcomeCalibrationProfile } from '../src/planning/OutcomeCalibration.js'
+import { buildOutcomeCalibrationSelection } from '../src/planning/OutcomeCalibrationContract.js'
 
 /** Clock whose ISO output advances, so lastActivityAt ordering is meaningful. */
 function advancingClock(startIso: string): Clock {
@@ -47,7 +49,12 @@ function message(
 async function makeSession(
   workspaceRoot: string,
   sessionId: string,
-  options: { startIso: string; prompts?: string[]; withAssistant?: boolean },
+  options: {
+    startIso: string
+    prompts?: string[]
+    withAssistant?: boolean
+    withCalibration?: boolean
+  },
 ): Promise<void> {
   const dir = join(workspaceRoot, '.agent', 'sessions', sessionId)
   await mkdir(dir, { recursive: true })
@@ -66,6 +73,21 @@ async function makeSession(
     'boot',
     'flush',
   )
+  if (options.withCalibration) {
+    await journal.append(
+      {
+        type: 'outcome.calibration.selected',
+        selection: buildOutcomeCalibrationSelection({
+          origin: 'history_scan',
+          scanStatus: 'no_history',
+          eligibleBefore: options.startIso,
+          profile: emptyOutcomeCalibrationProfile(),
+        }),
+      },
+      'boot',
+      'flush',
+    )
+  }
 
   for (const [index, prompt] of (options.prompts ?? []).entries()) {
     const fact: FactEvent = {
@@ -218,6 +240,21 @@ describe('empty session cleanup', () => {
       expect(await removeSessionIfUnused(root, 'ses_empty')).toBe(true)
       const remaining = await readdir(join(root, '.agent', 'sessions'))
       expect(remaining).not.toContain('ses_empty')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test('bootstrap calibration selection does not keep an otherwise unused session', async () => {
+    const root = await workspace()
+    try {
+      await makeSession(root, 'ses_calibration_only', {
+        startIso: '2026-08-02T18:00:00.000Z',
+        withCalibration: true,
+      })
+      expect(await removeSessionIfUnused(root, 'ses_calibration_only')).toBe(true)
+      const remaining = await readdir(join(root, '.agent', 'sessions'))
+      expect(remaining).not.toContain('ses_calibration_only')
     } finally {
       await rm(root, { recursive: true, force: true })
     }

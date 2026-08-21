@@ -30,6 +30,13 @@ export interface PlanVersion {
   createdAt: string
   approvedAt?: string
   approvalTokenId?: string
+  /** v1.1: approval-preserving replacement of exactly one failed step */
+  localRepair?: {
+    fromVersion: number
+    stepId: string
+    reason: string
+    authorization: 'bounded_local_repair'
+  }
 }
 
 export interface ApprovalToken {
@@ -54,6 +61,8 @@ export interface PlanTask {
   id: string
   planId?: string
   planVersion?: number
+  /** explicit binding enables step-local replanning */
+  stepId?: string
   subject: string
   description: string
   activeForm: string

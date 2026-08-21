@@ -13,6 +13,70 @@ import { IdempotencyLedger } from '../src/tools/IdempotencyLedger.js'
 import type { FactEvent, StateSnapshot } from '../src/core/events.js'
 
 describe('snapshot + tail recovery', () => {
+  test('partial batch acceptance is reconstructed from the durable assistant message', async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), 'agent-partial-batch-'))
+    const sessionId = 'partial-batch-session'
+    const journalPath = join(
+      workspaceRoot, '.agent', 'sessions', sessionId, 'journal.jsonl',
+    )
+    try {
+      const journal = new SessionJournal({
+        filePath: journalPath, sessionId, runId: 'run_partial',
+        clock: fixedClock(), ids: createSequentialIds(),
+      })
+      await journal.append(
+        { type: 'run.started', runId: 'run_partial', configHash: 'h' },
+        'turn_partial', 'flush',
+      )
+      await journal.append({
+        type: 'assistant.message.completed',
+        message: {
+          id: 'assistant_batch', parentId: null, sessionId,
+          turnId: 'turn_partial', role: 'assistant',
+          createdAt: '2026-01-01T00:00:00.000Z',
+          content: [
+            { type: 'tool_call', id: 'call_1', name: 'Read', input: { path: 'a.txt' } },
+            { type: 'tool_call', id: 'call_2', name: 'Read', input: { path: 'b.txt' } },
+          ],
+        },
+      }, 'turn_partial', 'flush')
+      await journal.append({
+        type: 'tool.call.accepted',
+        call: {
+          id: 'call_1', name: 'Read', input: { path: 'a.txt' },
+          parentMessageId: 'assistant_batch', receivedIndex: 0,
+        },
+      }, 'turn_partial', 'flush')
+
+      const loaded = await loadSession(journalPath)
+      expect(loaded.openToolCalls.map(call => call.id).sort()).toEqual([
+        'call_1', 'call_2',
+      ])
+
+      const world = await makeWorld({
+        persist: true, sessionId, workspaceRoot, turns: [],
+      })
+      try {
+        const resumed = await resumeState(world.runtime, loaded)
+        const accepted = resumed.recoveryFacts.filter(
+          fact => fact.type === 'tool.call.accepted',
+        )
+        expect(accepted).toHaveLength(1)
+        expect(accepted[0]).toMatchObject({ call: { id: 'call_2' } })
+        const completed = resumed.recoveryFacts
+          .filter(fact => fact.type === 'tool.call.completed')
+          .map(fact => fact.type === 'tool.call.completed' ? fact.result.callId : '')
+          .sort()
+        expect(completed).toEqual(['call_1', 'call_2'])
+        expect(resumed.state.pendingToolCalls).toEqual([])
+      } finally {
+        await world.cleanup()
+      }
+    } finally {
+      await rm(workspaceRoot, { recursive: true, force: true })
+    }
+  })
+
   test('snapshot is written periodically and loader identifies it', async () => {
     const world = await makeWorld({
       persist: true,
@@ -262,6 +326,7 @@ describe('createSnapshot / restoreFromSnapshot roundtrip', () => {
       prePlanMode: 'acceptEdits' as const,
       activePlan: { planId: 'plan_1', version: 2, approved: true },
       recovery: {
+        ...state.recovery,
         modelRetries: 2,
         compactFailures: 1,
         promptOverflowRecovered: true,
@@ -287,6 +352,7 @@ describe('createSnapshot / restoreFromSnapshot roundtrip', () => {
       workspace: {
         root: '/workspace',
         touchedFiles: ['a.ts', 'b.ts'],
+        planScopedTouchedFiles: ['b.ts'],
         createdFiles: ['c.ts'],
         deletedFiles: [],
       },
@@ -315,6 +381,7 @@ describe('createSnapshot / restoreFromSnapshot roundtrip', () => {
     expect(restored.budget.used.modelCalls).toBe(10)
     expect(restored.budget.used.toolCalls).toBe(25)
     expect(restored.workspace.touchedFiles).toEqual(['a.ts', 'b.ts'])
+    expect(restored.workspace.planScopedTouchedFiles).toEqual(['b.ts'])
     expect(restored.workspace.createdFiles).toEqual(['c.ts'])
     expect(restored.evidenceIds).toEqual(['ev_1', 'ev_2'])
     // runId/turnId come from the fresh state, not the snapshot

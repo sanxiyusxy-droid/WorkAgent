@@ -1,6 +1,7 @@
 import type { AgentState } from '../core/state.js'
 import type { PlanVersion, PlanTask } from './types.js'
 import type { EvidenceReceipt } from '../verification/types.js'
+import { workspacePathKey } from '../workspace/pathKey.js'
 
 /**
  * Replan trigger detection (guide §8.5).
@@ -18,6 +19,7 @@ export type ReplanCause =
   | { type: 'version_conflict_threshold'; conflicts: number; threshold: number }
   | { type: 'scope_exceeded'; plannedFiles: string[]; actualFiles: string[] }
   | { type: 'verification_failed'; failures: string[] }
+  | { type: 'reflection_ineffective'; count: number; threshold: number }
   | { type: 'budget_pressure'; remaining: number; kind: string }
 
 export interface ReplanDecision {
@@ -37,6 +39,8 @@ export interface ReplanConfig {
   scopeRatio: number
   /** budget remaining ratio that triggers pressure warning (default 0.15) */
   budgetPressureRatio: number
+  /** consecutive ineffective reflection outcomes before local repair (default 2) */
+  ineffectiveReflectionThreshold: number
 }
 
 const DEFAULT_CONFIG: ReplanConfig = {
@@ -44,6 +48,7 @@ const DEFAULT_CONFIG: ReplanConfig = {
   conflictThreshold: 3,
   scopeRatio: 2.0,
   budgetPressureRatio: 0.15,
+  ineffectiveReflectionThreshold: 2,
 }
 
 /**
@@ -60,6 +65,8 @@ export function detectReplanTrigger(input: {
   versionConflicts: number
   /** verification failures from the latest report */
   verificationFailures?: string[]
+  /** fact-level v1.4 reflection outcomes */
+  ineffectiveReflections?: number
 }): ReplanDecision {
   const config = { ...DEFAULT_CONFIG, ...input.config }
   const { state, approvedPlan } = input
@@ -99,8 +106,30 @@ export function detectReplanTrigger(input: {
 
   // 3. scope exceeded: actual touched files far exceed planned files
   if (approvedPlan && approvedPlan.steps.length > 0) {
-    const plannedFiles = new Set(approvedPlan.steps.flatMap(s => s.files))
-    const actualFiles = state.workspace.touchedFiles
+    const plannedFiles = new Set<string>()
+    const invalidPlanFiles: string[] = []
+    for (const path of approvedPlan.steps.flatMap(step => step.files)) {
+      try {
+        plannedFiles.add(workspacePathKey(state.workspace.root, path))
+      } catch {
+        invalidPlanFiles.push(path)
+      }
+    }
+    const actualFiles = state.workspace.planScopedTouchedFiles
+    if (invalidPlanFiles.length > 0) {
+      return {
+        required: true,
+        cause: {
+          type: 'scope_exceeded',
+          plannedFiles: invalidPlanFiles,
+          actualFiles,
+        },
+        requiresReapproval: true,
+        message:
+          `Approved plan contains invalid workspace file paths: ` +
+          `${invalidPlanFiles.slice(0, 5).join(', ')}. Persist a validated replacement plan.`,
+      }
+    }
     if (plannedFiles.size > 0) {
       const unplanned = actualFiles.filter(f => !plannedFiles.has(f))
       const ratio = unplanned.length / plannedFiles.size
@@ -137,7 +166,27 @@ export function detectReplanTrigger(input: {
     }
   }
 
-  // 5. budget pressure
+  // 5. repeated reflection recommendations without measurable progress
+  if (
+    approvedPlan &&
+    (input.ineffectiveReflections ?? 0) >= config.ineffectiveReflectionThreshold
+  ) {
+    return {
+      required: true,
+      cause: {
+        type: 'reflection_ineffective',
+        count: input.ineffectiveReflections ?? 0,
+        threshold: config.ineffectiveReflectionThreshold,
+      },
+      requiresReapproval: false,
+      message:
+        `${input.ineffectiveReflections ?? 0} consecutive reflection recommendations ` +
+        'produced no measurable task, evidence, or workspace progress. ' +
+        'Repair the smallest affected plan step and change the working hypothesis.',
+    }
+  }
+
+  // 6. budget pressure
   const budgetRemaining = 1 - (state.budget.used.modelCalls / state.budget.maxModelCalls)
   if (budgetRemaining <= config.budgetPressureRatio && state.budget.maxModelCalls > 0) {
     return {
@@ -183,9 +232,20 @@ export function checkPlanConstraints(input: {
   const violations: PlanConstraintViolation[] = []
 
   // 1. modified files should belong to approved plan steps
-  const plannedFiles = new Set(approvedPlan.steps.flatMap(s => s.files))
+  const plannedFiles = new Set<string>()
+  for (const path of approvedPlan.steps.flatMap(step => step.files)) {
+    try {
+      plannedFiles.add(workspacePathKey(state.workspace.root, path))
+    } catch {
+      violations.push({
+        kind: 'plan_stale',
+        detail: `approved plan contains invalid workspace file path "${path}"`,
+        severity: 'error',
+      })
+    }
+  }
   if (plannedFiles.size > 0) {
-    for (const file of state.workspace.touchedFiles) {
+    for (const file of state.workspace.planScopedTouchedFiles) {
       if (!plannedFiles.has(file)) {
         violations.push({
           kind: 'unplanned_file',

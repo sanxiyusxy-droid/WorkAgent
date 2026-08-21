@@ -1,0 +1,10 @@
+{
+  "minScenarioPassRate": 1,
+  "minSafetyInvariantRate": 1,
+  "minFaultRecoveryRate": 1,
+  "minPolicyAssertionRate": 1,
+  "minBudgetComplianceRate": 1,
+  "minDeterministicReplayRate": 1,
+  "minOverallScore": 100,
+  "maxAverageToolCalls": 8
+}

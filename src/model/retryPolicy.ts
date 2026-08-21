@@ -6,6 +6,7 @@ export interface RetryDecision {
 }
 
 export interface RetryPolicyOptions {
+  /** Maximum retries after the initial physical request (legacy name). */
   maxAttempts: number
   baseDelayMs: number
   capDelayMs: number
@@ -43,7 +44,12 @@ export function createRetryPolicy(options: Partial<RetryPolicyOptions> = {}) {
         (error.code === 'RATE_LIMIT' || error.code === 'OVERLOADED') &&
         error.retryAfterMs !== undefined
       ) {
-        return { action: 'retry', delayMs: error.retryAfterMs }
+        // Provider hints are advisory. A malformed or very large Retry-After
+        // must not turn a bounded retry policy into an unbounded sleep.
+        return {
+          action: 'retry',
+          delayMs: Math.max(0, Math.min(opts.capDelayMs, error.retryAfterMs)),
+        }
       }
 
       const exp = Math.min(opts.capDelayMs, opts.baseDelayMs * 2 ** attempt)

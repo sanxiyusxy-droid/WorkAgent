@@ -1,4 +1,11 @@
-import type { AgentEvent, FactEvent, TerminalReason, ContinueTransition, LoopPhase } from './events.js'
+import type {
+  AgentEvent,
+  FactEvent,
+  TerminalReason,
+  ContinueTransition,
+  LoopPhase,
+  ModelAttemptFailure,
+} from './events.js'
 import { isFactEvent } from './events.js'
 import type { AgentState } from './state.js'
 import { reduce, createSnapshot } from './state.js'
@@ -28,6 +35,31 @@ import {
   type ReplanConfig,
   type ReplanDecision,
 } from '../planning/ReplanDetector.js'
+import {
+  adaptiveMaxOutputTokens,
+  buildReflection,
+  deriveExecutionStrategy,
+  detectStagnation,
+  renderReflection,
+  shouldReflect,
+  strategyInstructions,
+} from './LoopIntelligence.js'
+import type { ReflectionRecord } from './events.js'
+import {
+  assessPlanHealth,
+  evaluateReflectionEffect,
+  renderPlanSupervision,
+} from '../planning/PlanSupervisor.js'
+import {
+  calibrateReflectionDecision,
+  renderOutcomeCalibrationProfile,
+  type OutcomeCalibrationProfile,
+} from '../planning/OutcomeCalibration.js'
+import {
+  buildToolExecutionLane,
+  renderToolExecutionLane,
+  type ToolExecutionLane,
+} from '../planning/ToolExecutionLane.js'
 
 export interface EngineDeps {
   model: ModelGateway
@@ -38,6 +70,10 @@ export interface EngineDeps {
   journal: SessionJournal | null
   clock: Clock
   ids: IdGenerator
+  /** Non-persistent fallback profile; durable sessions read their pin from state. */
+  outcomeCalibration?: OutcomeCalibrationProfile
+  /** Current config may suppress a durable selection without deleting it. */
+  outcomeCalibrationEnabled?: boolean
   /** M6 layered context manager; optional for lean setups */
   context?: ContextManager
   /** M5 completion gate dependencies; gate is skipped when absent */
@@ -52,6 +88,8 @@ export interface EngineDeps {
   /** runtime write gate for replans awaiting re-approval; the schema
    * projection closes too (registry.availableFor writeLocked) */
   onWriteGateChange?: (pending: boolean) => void
+  /** enables PlanRepair only for an active low-impact replan */
+  onLocalPlanRepairChange?: (pending: boolean) => void
   config: {
     maxOutputTokens: number
     artifactDir: string
@@ -62,16 +100,37 @@ export interface EngineDeps {
     maxRepairAttempts?: number
     /** replan trigger configuration */
     replan?: Partial<ReplanConfig>
+    /** v1.1 loop intelligence; composition root enables it by default */
+    intelligence?: {
+      enabled?: boolean
+      reflectionInterval?: number
+      reflectionEvaluationWindow?: number
+      completionReflection?: boolean
+    }
   }
-  sleep?: (ms: number) => Promise<void>
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>
 }
 
 type ModelTurnOutcome =
-  | { kind: 'assembled'; turn: AssembledTurn }
-  | { kind: 'fatal'; terminal: TerminalReason }
+  | { kind: 'assembled'; turn: AssembledTurn; failures: ModelAttemptFailure[] }
+  | { kind: 'fatal'; terminal: TerminalReason; failures: ModelAttemptFailure[] }
 
-const defaultSleep = (ms: number) =>
-  new Promise<void>(resolve => setTimeout(resolve, ms))
+const defaultSleep = (ms: number, signal?: AbortSignal) =>
+  new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason ?? new Error('aborted'))
+      return
+    }
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(signal?.reason ?? new Error('aborted'))
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
 
 /**
  * The agent main loop. Orchestration only — model turn collection, tool
@@ -100,8 +159,29 @@ export class AgentEngine {
         // sync the runtime write gate from durable state every iteration —
         // this also restores the lock automatically after recovery
         this.d.onWriteGateChange?.(
-          state.recovery.replanning && state.recovery.replanAwaitingApproval,
+          state.recovery.degradedRecovery ||
+            (state.recovery.replanning && state.recovery.replanAwaitingApproval),
         )
+        this.d.onLocalPlanRepairChange?.(
+          !state.recovery.degradedRecovery &&
+            state.recovery.replanning &&
+            !state.recovery.replanAwaitingApproval,
+        )
+
+        if (this.intelligenceEnabled()) {
+          state = yield* this.supervisePlan(state)
+          const adaptation = deriveExecutionStrategy(state)
+          if (adaptation) {
+            const strategyFact: FactEvent = {
+              type: 'strategy.adapted',
+              from: state.recovery.executionStrategy,
+              to: adaptation.strategy,
+              reason: adaptation.reason,
+            }
+            yield strategyFact
+            state = yield* this.persistAndReduce(state, strategyFact, 'flush')
+          }
+        }
 
         state = { ...state, phase: 'preparing_context' }
         yield { type: 'status.changed', phase: state.phase }
@@ -120,13 +200,84 @@ export class AgentEngine {
         }
 
         const writeLocked =
-          state.recovery.replanning && state.recovery.replanAwaitingApproval
+          state.recovery.degradedRecovery ||
+          (state.recovery.replanning && state.recovery.replanAwaitingApproval)
+        const strategyInstruction = strategyInstructions(
+          state.recovery.executionStrategy,
+        )
+        const latestReflection = state.reflections[state.reflections.length - 1]
+        const reflectionInstruction = latestReflection
+          ? renderReflection(latestReflection)
+          : undefined
+        const latestEvaluation = state.reflectionEvaluations[
+          state.reflectionEvaluations.length - 1
+        ]
+        const supervisionInstruction = state.latestPlanHealth
+          ? renderPlanSupervision(
+              state.latestPlanHealth,
+              latestEvaluation?.reflectionId === latestReflection?.id
+                ? latestEvaluation
+                : undefined,
+            )
+          : undefined
+        const calibrationProfile = this.calibrationProfile(state)
+        const calibrationInstruction =
+          state.latestPlanHealth && calibrationProfile
+            ? renderOutcomeCalibrationProfile(
+                calibrationProfile,
+                state.outcomeCalibrationSelection?.hash,
+              )
+            : undefined
+        const baseTools = this.d.registry.availableFor(state.mode, { writeLocked })
+        const executionLane = this.intelligenceEnabled()
+          ? buildToolExecutionLane({
+              assessment: state.latestPlanHealth,
+              mode: state.mode,
+              writeLocked,
+              candidateTools: baseTools.map(tool => tool.name),
+              replanning: state.recovery.replanning,
+            })
+          : undefined
+        const laneInstruction = renderToolExecutionLane(executionLane)
+        if (executionLane) {
+          const laneFact: FactEvent = {
+            type: 'tool.lane.selected',
+            selection: {
+              version: executionLane.version,
+              turnId: state.turnId,
+              assessmentSignature: executionLane.assessmentSignature,
+              action: executionLane.action,
+              lane: executionLane.lane,
+              mode: executionLane.mode,
+              writeLocked: executionLane.writeLocked,
+              replanning: executionLane.replanning,
+              allowedTools: [...executionLane.allowedTools],
+              blockedTools: [...executionLane.blockedTools],
+              hash: executionLane.hash,
+            },
+          }
+          yield laneFact
+          state = yield* this.persistAndReduce(state, laneFact, 'flush')
+        }
         const request = assemblePrompt({
           mode: state.mode,
           messages: state.messages,
-          tools: this.d.registry.availableFor(state.mode, { writeLocked }),
-          maxOutputTokens: this.d.config.maxOutputTokens,
-          projectInstructions: this.d.config.projectInstructions,
+          tools: this.d.registry.availableFor(state.mode, {
+            writeLocked,
+            lane: executionLane,
+          }),
+          maxOutputTokens: adaptiveMaxOutputTokens(
+            this.d.config.maxOutputTokens,
+            state.recovery.executionStrategy,
+          ),
+          projectInstructions: [
+            this.d.config.projectInstructions,
+            strategyInstruction,
+            reflectionInstruction,
+            supervisionInstruction,
+            calibrationInstruction,
+            laneInstruction,
+          ].filter((value): value is string => Boolean(value)).join('\n\n') || undefined,
           environment: this.d.config.environment,
         })
 
@@ -145,6 +296,16 @@ export class AgentEngine {
         yield { type: 'status.changed', phase: state.phase }
 
         const outcome = yield* this.collectModelTurn(state, request, signal)
+        for (const failure of outcome.failures) {
+          const failureFact: FactEvent = {
+            type: 'model.attempt.failed',
+            failure,
+          }
+          yield failureFact
+          // collectModelTurn flushes each failure before retrying so a crash
+          // during backoff cannot erase a consumed physical model call.
+          state = reduce(state, failureFact)
+        }
         if (outcome.kind === 'fatal') {
           // ---- reactive compact: exactly one recovery for PROMPT_TOO_LONG ----
           if (
@@ -202,7 +363,14 @@ export class AgentEngine {
           state = { ...state, phase: 'executing_tools' }
           yield { type: 'status.changed', phase: state.phase }
 
-          const execution = this.executeToolBatch(state, turn.message, calls, signal)
+          const execution = this.executeToolBatch(
+            state,
+            turn.message,
+            calls,
+            signal,
+            executionLane,
+            writeLocked,
+          )
           let result = await execution.next()
           while (!result.done) {
             const event = result.value
@@ -232,7 +400,31 @@ export class AgentEngine {
           }
 
           // ---- replan detection (bounded: max 2 replans per run) ----
-          state = this.trackToolOutcomes(state, calls)
+          if (this.intelligenceEnabled()) {
+            state = yield* this.supervisePlan(state)
+            const stagnation = detectStagnation(state)
+            if (stagnation) {
+              const stagnationFact: FactEvent = {
+                type: 'loop.stagnation.detected',
+                record: stagnation,
+              }
+              yield stagnationFact
+              state = yield* this.persistAndReduce(state, stagnationFact, 'flush')
+              state = yield* this.recordReflection(
+                state,
+                'stagnation',
+                stagnation.detail,
+                false,
+              )
+            } else if (
+              shouldReflect(state, 'periodic', this.reflectionInterval())
+            ) {
+              // Periodic reflection is an audit/policy checkpoint. It is not
+              // injected into context every time; stagnation reflections are,
+              // which avoids long-run prompt growth and summarizer churn.
+              state = yield* this.recordReflection(state, 'periodic', undefined, false)
+            }
+          }
           if (state.recovery.replanCount < 2 && this.d.gate?.plans) {
             const replan = detectReplanTrigger({
               state,
@@ -240,6 +432,7 @@ export class AgentEngine {
               config: this.d.config.replan,
               consecutiveFailures: state.recovery.consecutiveFailures,
               versionConflicts: state.recovery.versionConflicts,
+              ineffectiveReflections: state.recovery.ineffectiveReflectionCount,
             })
             if (replan.required) {
               state = yield* this.applyReplan(state, replan)
@@ -281,6 +474,23 @@ export class AgentEngine {
         // ---- no tool calls: completion gate ----
         state = { ...state, phase: 'evaluating_completion' }
         yield { type: 'status.changed', phase: state.phase }
+
+        // One bounded completion reflection gives the model a final chance
+        // to notice stale evidence or an unsupported completion claim.
+        if (
+          this.intelligenceEnabled() &&
+          this.d.config.intelligence?.completionReflection !== false &&
+          shouldReflect(state, 'completion', this.reflectionInterval())
+        ) {
+          state = yield* this.recordReflection(state, 'completion', undefined, false)
+          const transitionFact: FactEvent = {
+            type: 'loop.transitioned',
+            transition: { reason: 'reflection_requested', trigger: 'completion' },
+          }
+          yield transitionFact
+          state = yield* this.persistAndReduce(state, transitionFact, 'buffered')
+          continue
+        }
 
         if (this.d.gate) {
           // freshness snapshot for the gate: receipts signed for an older
@@ -331,6 +541,39 @@ export class AgentEngine {
             continue
           }
 
+          // Recovery reconciliation: a non-PASS verdict may have been
+          // flushed just before the process stopped. Never let the presence
+          // of that durable verdict skip verification and fall through to a
+          // successful completion on resume.
+          if (
+            state.lastVerification &&
+            (!state.lastVerification.valid ||
+              state.lastVerification.report.verdict !== 'PASS')
+          ) {
+            const persistedReport = state.lastVerification.report
+            if (state.recovery.replanCount < 2 && this.d.gate?.plans) {
+              const replan = detectReplanTrigger({
+                state,
+                approvedPlan: this.d.gate.plans.lastApproved(),
+                config: this.d.config.replan,
+                consecutiveFailures: state.recovery.consecutiveFailures,
+                versionConflicts: state.recovery.versionConflicts,
+                verificationFailures: persistedReport.failures.map(f => f.title),
+              })
+              if (replan.required) {
+                state = yield* this.applyReplan(state, replan)
+                continue
+              }
+            }
+            return yield* this.terminate(state, {
+              reason: 'completed_with_unverified_items',
+              items: [
+                ...persistedReport.failures.map(f => f.title),
+                ...persistedReport.unverified.map(u => `${u.item}: ${u.reason}`),
+              ],
+            })
+          }
+
           // ---- L2 independent verification on high-risk completion ----
           if (
             gate.requiresVerification &&
@@ -346,25 +589,29 @@ export class AgentEngine {
               touchedSummary: this.describeWrites(state),
               signal,
             })
+            const maxRepairs = this.d.config.maxRepairAttempts ?? 1
+            const repairAttempt =
+              outcome.report.verdict === 'FAIL' &&
+              state.recovery.verifierRepairs < maxRepairs
+                ? state.recovery.verifierRepairs + 1
+                : undefined
             const verificationFact: FactEvent = {
               type: 'verification.completed',
               report: outcome.report,
               valid: outcome.valid,
+              ...(repairAttempt !== undefined ? { repairAttempt } : {}),
             }
             yield verificationFact
             state = yield* this.persistAndReduce(state, verificationFact, 'flush')
 
-            const maxRepairs = this.d.config.maxRepairAttempts ?? 1
-            if (
-              outcome.report.verdict === 'FAIL' &&
-              state.recovery.verifierRepairs < maxRepairs
-            ) {
-              state = {
-                ...state,
-                recovery: {
-                  ...state.recovery,
-                  verifierRepairs: state.recovery.verifierRepairs + 1,
-                },
+            if (repairAttempt !== undefined) {
+              if (this.intelligenceEnabled()) {
+                state = yield* this.recordReflection(
+                  state,
+                  'verification',
+                  `Verifier reported ${outcome.report.failures.length} failures.`,
+                  false,
+                )
               }
               const repairText =
                 'Independent verification FAILED. Fix these findings, then re-verify:\n' +
@@ -384,13 +631,11 @@ export class AgentEngine {
               }
               yield messageFact
               state = yield* this.persistAndReduce(state, messageFact, 'flush')
-              // clear lastVerification so re-verification runs after the repair
-              state = { ...state, lastVerification: undefined }
               const transitionFact: FactEvent = {
                 type: 'loop.transitioned',
                 transition: {
                   reason: 'verification_repair',
-                  attempt: state.recovery.verifierRepairs,
+                  attempt: repairAttempt,
                 },
               }
               yield transitionFact
@@ -412,11 +657,6 @@ export class AgentEngine {
                 })
                 if (replan.required) {
                   state = yield* this.applyReplan(state, replan)
-                  state = {
-                    ...state,
-                    lastVerification: undefined,
-                    recovery: { ...state.recovery, verifierRepairs: 0 },
-                  }
                   continue
                 }
               }
@@ -490,6 +730,140 @@ export class AgentEngine {
       .join('\n')
   }
 
+  private intelligenceEnabled(): boolean {
+    return this.d.config.intelligence?.enabled === true
+  }
+
+  private reflectionInterval(): number {
+    return Math.max(1, this.d.config.intelligence?.reflectionInterval ?? 8)
+  }
+
+  private reflectionEvaluationWindow(): number {
+    return Math.max(
+      1,
+      Math.min(20, this.d.config.intelligence?.reflectionEvaluationWindow ?? 3),
+    )
+  }
+
+  private async *supervisePlan(
+    state: AgentState,
+  ): AsyncGenerator<AgentEvent, AgentState> {
+    const evaluatedReflectionIds = new Set(
+      state.reflectionEvaluations.map(item => item.reflectionId),
+    )
+    const pendingReflection = state.reflections.find(
+      reflection =>
+        reflection.decision !== undefined &&
+        reflection.progress.evidenceReceipts !== undefined &&
+        reflection.progress.successfulToolCalls !== undefined &&
+        !evaluatedReflectionIds.has(reflection.id),
+    )
+    if (pendingReflection) {
+      const evaluation = evaluateReflectionEffect({
+        state,
+        reflection: pendingReflection,
+        id: 'pending',
+        createdAt: this.d.clock.isoNow(),
+        evaluationWindow:
+          pendingReflection.decision?.evaluateAfterToolCalls ??
+          this.reflectionEvaluationWindow(),
+      })
+      if (evaluation) {
+        const durableEvaluation = {
+          ...evaluation,
+          id: this.d.ids.next('reflection_evaluation'),
+        }
+        const evaluationFact: FactEvent = {
+          type: 'reflection.evaluated',
+          evaluation: durableEvaluation,
+        }
+        yield evaluationFact
+        state = yield* this.persistAndReduce(state, evaluationFact, 'flush')
+      }
+    }
+
+    const evidence = this.d.gate?.evidence?.list() ?? []
+    const staleEvidenceIds =
+      this.d.gate?.evidence && evidence.length > 0
+        ? await findStaleReceipts(this.d.gate.evidence)
+        : undefined
+    const assessment = assessPlanHealth({
+      state,
+      approvedPlan: this.d.gate?.plans?.lastApproved(),
+      evidence,
+      id: 'pending',
+      createdAt: this.d.clock.isoNow(),
+      staleEvidenceIds,
+    })
+    if (assessment.signature !== state.latestPlanHealth?.signature) {
+      const durableAssessment = {
+        ...assessment,
+        id: this.d.ids.next('plan_health'),
+      }
+      const healthFact: FactEvent = {
+        type: 'plan.health.assessed',
+        assessment: durableAssessment,
+      }
+      yield healthFact
+      state = yield* this.persistAndReduce(state, healthFact, 'flush')
+    }
+    return state
+  }
+
+  private async *recordReflection(
+    state: AgentState,
+    trigger: ReflectionRecord['trigger'],
+    detail: string | undefined,
+    inject: boolean,
+  ): AsyncGenerator<AgentEvent, AgentState> {
+    const evaluatedReflectionIds = new Set(
+      state.reflectionEvaluations.map(item => item.reflectionId),
+    )
+    const pendingReflection = state.reflections.some(
+      reflection =>
+        reflection.decision !== undefined &&
+        reflection.progress.evidenceReceipts !== undefined &&
+        reflection.progress.successfulToolCalls !== undefined &&
+        !evaluatedReflectionIds.has(reflection.id),
+    )
+    // Single-flight: never overwrite an unevaluated baseline with a newer
+    // reflection. Otherwise long windows would bias history toward early
+    // successes while no-progress outcomes silently disappear.
+    if (pendingReflection) return state
+    const calibrationProfile = this.calibrationProfile(state)
+    const reflection = calibrateReflectionDecision(buildReflection({
+      state,
+      id: this.d.ids.next('reflection'),
+      createdAt: this.d.clock.isoNow(),
+      trigger,
+      detail,
+      assessment: state.latestPlanHealth,
+      evaluationWindow: this.reflectionEvaluationWindow(),
+    }), calibrationProfile, state.outcomeCalibrationSelection?.hash)
+    const reflectionFact: FactEvent = {
+      type: 'reflection.recorded',
+      reflection,
+    }
+    yield reflectionFact
+    state = yield* this.persistAndReduce(state, reflectionFact, 'flush')
+    if (inject) {
+      const messageFact: FactEvent = {
+        type: 'user.message.accepted',
+        message: this.makeEngineMessage(state, renderReflection(reflection)),
+      }
+      yield messageFact
+      state = yield* this.persistAndReduce(state, messageFact, 'flush')
+    }
+    return state
+  }
+
+  private calibrationProfile(
+    state: AgentState,
+  ): OutcomeCalibrationProfile | undefined {
+    if (this.d.outcomeCalibrationEnabled === false) return undefined
+    return state.outcomeCalibrationSelection?.profile ?? this.d.outcomeCalibration
+  }
+
   private checkPreflight(
     state: AgentState,
     signal: AbortSignal,
@@ -499,10 +873,10 @@ export class AgentEngine {
       return { reason: 'max_turns', turns: state.iteration }
     }
     if (state.budget.used.modelCalls >= state.budget.maxModelCalls) {
-      return { reason: 'budget_exhausted', kind: 'tokens' }
+      return { reason: 'budget_exhausted', kind: 'model_calls' }
     }
     if (state.budget.used.toolCalls >= state.budget.maxToolCalls) {
-      return { reason: 'budget_exhausted', kind: 'tokens' }
+      return { reason: 'budget_exhausted', kind: 'tool_calls' }
     }
     if (
       this.d.clock.now() - state.budget.used.startedAt >=
@@ -521,8 +895,20 @@ export class AgentEngine {
   ): AsyncGenerator<AgentEvent, ModelTurnOutcome> {
     const sleep = this.d.sleep ?? defaultSleep
     let attempt = 0
+    const failures: ModelAttemptFailure[] = []
+    const remainingCalls = Math.max(
+      0,
+      state.budget.maxModelCalls - state.budget.used.modelCalls,
+    )
 
     while (true) {
+      if (attempt >= remainingCalls) {
+        return {
+          kind: 'fatal',
+          terminal: { reason: 'budget_exhausted', kind: 'model_calls' },
+          failures,
+        }
+      }
       // A fresh assembler per attempt — never reuse a polluted one.
       const assembler = new StreamAssembler({
         ids: this.d.ids,
@@ -549,26 +935,88 @@ export class AgentEngine {
             }
           }
         }
-        return { kind: 'assembled', turn: assembler.finish() }
+        return { kind: 'assembled', turn: assembler.finish(), failures }
       } catch (error) {
         if (signal.aborted) {
-          return { kind: 'fatal', terminal: { reason: 'aborted', at: 'calling_model' } }
+          return {
+            kind: 'fatal',
+            terminal: { reason: 'aborted', at: 'calling_model' },
+            failures,
+          }
         }
         const classified: ModelError = this.d.model.classifyError(error)
         if (classified.code === 'PROMPT_TOO_LONG') {
-          return { kind: 'fatal', terminal: { reason: 'prompt_too_long' } }
+          const failure: ModelAttemptFailure = {
+            code: classified.code,
+            attempt: attempt + 1,
+            action: 'surface',
+            delayMs: 0,
+          }
+          await this.persistModelAttemptFailure(state, failure)
+          failures.push(failure)
+          return {
+            kind: 'fatal',
+            terminal: { reason: 'prompt_too_long' },
+            failures,
+          }
         }
         const decision = this.d.retryPolicy.decide({ error: classified, attempt })
         if (decision.action === 'surface') {
+          const failure: ModelAttemptFailure = {
+            code: classified.code,
+            attempt: attempt + 1,
+            action: 'surface',
+            delayMs: 0,
+          }
+          await this.persistModelAttemptFailure(state, failure)
+          failures.push(failure)
           return {
             kind: 'fatal',
             terminal: { reason: 'model_error', code: classified.code },
+            failures,
           }
         }
+        const failure: ModelAttemptFailure = {
+          code: classified.code,
+          attempt: attempt + 1,
+          action: 'retry',
+          delayMs: decision.delayMs ?? 0,
+        }
+        await this.persistModelAttemptFailure(state, failure)
+        failures.push(failure)
         attempt += 1
-        await sleep(decision.delayMs ?? 0)
+        if (attempt >= remainingCalls) {
+          return {
+            kind: 'fatal',
+            terminal: { reason: 'budget_exhausted', kind: 'model_calls' },
+            failures,
+          }
+        }
+        try {
+          await sleep(decision.delayMs ?? 0, signal)
+        } catch (sleepError) {
+          if (signal.aborted) {
+            return {
+              kind: 'fatal',
+              terminal: { reason: 'aborted', at: 'calling_model' },
+              failures,
+            }
+          }
+          throw sleepError
+        }
       }
     }
+  }
+
+  private async persistModelAttemptFailure(
+    state: AgentState,
+    failure: ModelAttemptFailure,
+  ): Promise<void> {
+    await this.d.journal?.append(
+      { type: 'model.attempt.failed', failure },
+      state.turnId,
+      'flush',
+    )
   }
 
   /**
@@ -582,6 +1030,8 @@ export class AgentEngine {
     parentMessage: ConversationMessage,
     blocks: Array<Extract<ContentBlock, { type: 'tool_call' }>>,
     signal: AbortSignal,
+    lane?: Readonly<ToolExecutionLane>,
+    writeLocked?: boolean,
   ): AsyncGenerator<AgentEvent> {
     const ledger = new ToolCallLedger()
     const calls: ToolCall[] = blocks.map((block, index) => ({
@@ -617,6 +1067,8 @@ export class AgentEngine {
           workspaceRoot: state.workspace.root,
           artifactDir: this.d.config.artifactDir,
           signal,
+          lane,
+          writeLocked,
           onTransient: event => transient.push(event),
         })
         for await (const event of generator) {
@@ -660,6 +1112,7 @@ export class AgentEngine {
         ok: result.ok,
         content: result.content,
         errorCode: result.errorCode,
+        observation: result.observation,
       }
     })
 
@@ -687,31 +1140,6 @@ export class AgentEngine {
     return reduce(state, fact)
   }
 
-  /** Track consecutive failures and version conflicts for replan detection.
-   * Counters live in state.recovery so snapshots preserve them. */
-  private trackToolOutcomes(state: AgentState, calls: Array<{ id: string }>): AgentState {
-    const batchResults = calls
-      .map(c => state.toolResults[c.id])
-      .filter((r): r is NonNullable<typeof r> => r !== undefined)
-    const allFailed = batchResults.length > 0 && batchResults.every(r => !r.ok)
-    let conflicts = state.recovery.versionConflicts
-    for (const r of batchResults) {
-      if (r.errorCode === 'FILE_VERSION_CONFLICT') {
-        conflicts++
-      }
-    }
-    return {
-      ...state,
-      recovery: {
-        ...state.recovery,
-        consecutiveFailures: allFailed
-          ? state.recovery.consecutiveFailures + 1
-          : 0,
-        versionConflicts: conflicts,
-      },
-    }
-  }
-
   /**
    * Replan protocol (guide §8.5). The durable `replan.requested` fact owns
    * the state transition (reducer sets replanning, bumps replanCount,
@@ -726,6 +1154,14 @@ export class AgentEngine {
     state: AgentState,
     replan: ReplanDecision,
   ): AsyncGenerator<AgentEvent, AgentState> {
+    if (this.intelligenceEnabled()) {
+      state = yield* this.recordReflection(
+        state,
+        'replan',
+        replan.message,
+        false,
+      )
+    }
     const requestedFact: FactEvent = {
       type: 'replan.requested',
       cause: replan.cause?.type ?? 'unknown',
@@ -733,6 +1169,11 @@ export class AgentEngine {
     }
     yield requestedFact
     state = yield* this.persistAndReduce(state, requestedFact, 'flush')
+
+    const approvedForLocalRepair = !replan.requiresReapproval
+      ? this.d.gate?.plans?.lastApproved()
+      : undefined
+    const canRepairLocally = Boolean(approvedForLocalRepair?.steps.length)
 
     if (replan.requiresReapproval) {
       const approved = this.d.gate?.plans?.lastApproved()
@@ -785,7 +1226,12 @@ export class AgentEngine {
       ? replan.message +
         '\nWrite tools are DISABLED until a revised plan version is approved. ' +
         'Explore read-only, persist the revision with PlanPropose, then call ExitPlanMode.'
-      : replan.message
+      : canRepairLocally
+        ? replan.message +
+          `\nUse PlanRepair on ${approvedForLocalRepair!.planId}@${approvedForLocalRepair!.version} ` +
+          'to replace only the affected step. Preserve dependencies and acceptance criteria; ' +
+          'a file-scope expansion requires a full PlanPropose + approval flow.'
+        : replan.message
     const injected = this.makeEngineMessage(state, instruction)
     const messageFact: FactEvent = {
       type: 'user.message.accepted',
@@ -804,7 +1250,7 @@ export class AgentEngine {
     yield transitionFact
     state = yield* this.persistAndReduce(state, transitionFact, 'buffered')
 
-    if (!replan.requiresReapproval) {
+    if (!replan.requiresReapproval && !canRepairLocally) {
       // low-impact replans close here: a durable adjustment fact records
       // WHAT changed and WHY, and the reducer exits `replanning`. The loop
       // never relies on the model replying "I adjusted" to end the state.
@@ -839,9 +1285,16 @@ export class AgentEngine {
 function factDurability(event: FactEvent): 'buffered' | 'flush' {
   switch (event.type) {
     case 'user.message.accepted':
+    case 'model.attempt.failed':
     case 'permission.decided':
     case 'tool.call.accepted':
     case 'tool.call.completed':
+    case 'reflection.recorded':
+    case 'reflection.evaluated':
+    case 'plan.health.assessed':
+    case 'tool.lane.selected':
+    case 'loop.stagnation.detected':
+    case 'strategy.adapted':
     case 'run.terminated':
       return 'flush'
     default:

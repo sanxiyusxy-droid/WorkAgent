@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import { defineTool } from '../tools/Tool.js'
 import type { AgentMode } from '../core/events.js'
+import { workspacePathKey } from '../workspace/pathKey.js'
 
 const EnterPlanModeInput = z.object({}).strict()
 
@@ -112,6 +113,21 @@ export const PlanProposeTool = defineTool<
     }
     const stepIds = new Set(input.steps.map(s => s.id))
     for (const step of input.steps) {
+      for (const file of step.files) {
+        try {
+          workspacePathKey(ctx.workspaceRoot, file)
+        } catch {
+          return {
+            ok: false,
+            error: {
+              code: 'SEMANTIC_VALIDATION_ERROR',
+              message: `step ${step.id} contains a path outside the workspace or not identifying a file: ${file}`,
+              retryable: true,
+              hint: 'Use a workspace-relative file path; do not use the workspace root or .. escapes.',
+            },
+          }
+        }
+      }
       for (const dep of step.dependsOn) {
         if (!stepIds.has(dep)) {
           return {
@@ -140,6 +156,206 @@ export const PlanProposeTool = defineTool<
     kind: 'text',
     text: `Plan persisted: ${output.planId} v${output.version}. Call ExitPlanMode with this exact reference to request user approval.`,
   }),
+})
+
+const PlanRepairInput = z.object({
+  planId: z.string().min(1),
+  version: z.number().int().positive(),
+  stepId: z.string().min(1),
+  reason: z.string().min(1),
+  replacement: z.object({
+    title: z.string().min(1).optional(),
+    description: z.string().min(1),
+    files: z.array(z.string()).optional(),
+    expectedOutcome: z.string().min(1).optional(),
+  }).strict(),
+}).strict()
+
+/**
+ * Low-impact replan primitive: replaces one step, preserves all other steps
+ * and criteria, and refuses file-scope expansion. The derived version keeps
+ * approval because its authorization is narrower than the approved plan.
+ */
+export const PlanRepairTool = defineTool({
+  name: 'PlanRepair',
+  description:
+    'During a low-impact replan, replace exactly one failed approved-plan step. ' +
+    'Files must stay inside the already approved plan scope; dependencies and ' +
+    'acceptance criteria are preserved. Returns a new approved plan version.',
+  inputSchema: PlanRepairInput,
+  maxResultChars: 8_000,
+  // Internal plan/task artifacts only; no workspace or external side effect.
+  // This matches PlanPropose/TaskUpdate permission semantics.
+  readOnly: () => true,
+  concurrency: () => 'exclusive',
+  interruptBehavior: () => 'block',
+  resources: () => [
+    { resource: 'state:plans', mode: 'write' },
+    { resource: 'state:tasks', mode: 'write' },
+  ],
+  permission: async () => ({ behavior: 'allow' }),
+
+  validate: async (input, ctx) => {
+    if (!ctx.services.canLocalPlanRepair?.()) {
+      return {
+        ok: false,
+        error: {
+          code: 'PRECONDITION_FAILED',
+          message: 'no low-impact replan is awaiting a local step repair',
+          retryable: false,
+          hint: 'PlanRepair is only enabled by an engine replan trigger.',
+        },
+      }
+    }
+    const plan = ctx.services.plans?.get(input.planId, input.version)
+    if (!plan || plan.status !== 'approved' || ctx.services.plans?.lastApproved() !== plan) {
+      return {
+        ok: false,
+        error: {
+          code: 'SEMANTIC_VALIDATION_ERROR',
+          message: `plan ${input.planId}@${input.version} is not the active approved plan`,
+          retryable: true,
+        },
+      }
+    }
+    if (!plan.steps.some(step => step.id === input.stepId)) {
+      return {
+        ok: false,
+        error: {
+          code: 'SEMANTIC_VALIDATION_ERROR',
+          message: `step ${input.stepId} is not in the approved plan`,
+          retryable: true,
+        },
+      }
+    }
+    let allowed: Set<string>
+    try {
+      allowed = new Set(
+        plan.steps
+          .flatMap(step => step.files)
+          .map(file => workspacePathKey(ctx.workspaceRoot, file)),
+      )
+    } catch {
+      return {
+        ok: false,
+        error: {
+          code: 'SEMANTIC_VALIDATION_ERROR',
+          message: 'the approved plan contains an invalid workspace file path',
+          retryable: false,
+          hint: 'Persist a replacement plan with validated workspace-relative paths.',
+        },
+      }
+    }
+    const replacementFiles = input.replacement.files ?? []
+    const expanded: string[] = []
+    for (const file of replacementFiles) {
+      try {
+        if (!allowed.has(workspacePathKey(ctx.workspaceRoot, file))) expanded.push(file)
+      } catch {
+        return {
+          ok: false,
+          error: {
+            code: 'SEMANTIC_VALIDATION_ERROR',
+            message: `local repair contains a path outside the workspace or not identifying a file: ${file}`,
+            retryable: true,
+          },
+        }
+      }
+    }
+    if (expanded.length > 0) {
+      return {
+        ok: false,
+        error: {
+          code: 'SEMANTIC_VALIDATION_ERROR',
+          message: `local repair would expand approved file scope: ${expanded.join(', ')}`,
+          retryable: true,
+          hint: 'Use PlanPropose and request approval for scope expansion.',
+        },
+      }
+    }
+    return { ok: true }
+  },
+
+  preconditions: async (input, ctx) => {
+    const active = ctx.services.plans?.lastApproved()
+    return [{
+      id: 'approved-version-unchanged',
+      passed: active?.planId === input.planId && active.version === input.version,
+      detail: active ? `${active.planId}@${active.version}` : 'none',
+    }]
+  },
+
+  execute: async (input, ctx) => {
+    const repaired = await ctx.services.plans!.createLocalRepair(input)
+    const migrated = ctx.services.tasks?.migratePlanVersion({
+      planId: input.planId,
+      fromVersion: input.version,
+      toVersion: repaired.plan.version,
+      repairedStepId: input.stepId,
+    }) ?? []
+    return {
+      data: {
+        planId: repaired.plan.planId,
+        fromVersion: repaired.previous.version,
+        version: repaired.plan.version,
+        stepId: input.stepId,
+        migratedTasks: migrated.length,
+      },
+      facts: [
+        {
+          type: 'plan.status.changed',
+          planId: repaired.previous.planId,
+          version: repaired.previous.version,
+          status: 'superseded',
+        },
+        { type: 'plan.version.created', plan: repaired.plan },
+        ...migrated.map(task => ({ type: 'task.changed' as const, task })),
+        {
+          type: 'replan.adjustment.applied',
+          cause: 'local_step_repair',
+          summary: `replaced step ${input.stepId} in ${input.planId}@${input.version}`,
+        },
+      ],
+      commitProof: `${repaired.plan.planId}@${repaired.plan.version}:${input.stepId}`,
+    }
+  },
+
+  postconditions: async (input, output, ctx) => {
+    const plan = ctx.services.plans?.get(output.planId, output.version)
+    return [
+      {
+        id: 'new-version-approved',
+        passed: plan?.status === 'approved',
+        detail: plan?.status ?? 'missing',
+      },
+      {
+        id: 'single-step-repair-recorded',
+        passed:
+          plan?.localRepair?.stepId === input.stepId &&
+          plan.localRepair.fromVersion === input.version,
+      },
+    ]
+  },
+
+  observe: async (_input, output) => ({
+    summary:
+      `Locally repaired step ${output.stepId}; plan advanced from v${output.fromVersion} ` +
+      `to approved v${output.version}`,
+    fields: { ...output, scopeExpanded: false },
+  }),
+
+  inspectOutcome: async (input, ctx) => {
+    const candidate = ctx.services.plans?.get(input.planId, input.version + 1)
+    const applied =
+      candidate?.localRepair?.fromVersion === input.version &&
+      candidate.localRepair.stepId === input.stepId
+    return {
+      applied,
+      detail: applied
+        ? `local repair exists as ${candidate!.planId}@${candidate!.version}`
+        : 'no matching derived plan version found',
+    }
+  },
 })
 
 const ExitPlanModeInput = z

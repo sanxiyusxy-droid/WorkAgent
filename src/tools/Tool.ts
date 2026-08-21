@@ -1,6 +1,8 @@
 import type { z } from 'zod'
 import type {
   StructuredToolError,
+  ToolContractCheck,
+  ToolObservation,
   ToolResultContent,
 } from '../core/messages.js'
 import type { AgentMode, FactEvent, PermissionBehavior } from '../core/events.js'
@@ -10,6 +12,8 @@ import type { TaskStore } from '../planning/TaskStore.js'
 import type { EvidenceStore } from '../verification/EvidenceStore.js'
 import type { PlanVersion } from '../planning/types.js'
 import type { IdempotencyRecord } from './IdempotencyLedger.js'
+import type { CodeIntelligenceService } from '../codeintel/CodeIntelligence.js'
+import type { CodeRetriever } from '../retrieval/CodeRetriever.js'
 
 export type ConcurrencyClass = 'shared' | 'exclusive'
 export type InterruptBehavior = 'cancel' | 'block'
@@ -45,6 +49,12 @@ export interface ToolServices {
   approvals?: ApprovalRegistry
   tasks?: TaskStore
   evidence?: EvidenceStore
+  /** shared, invalidatable source index used by code-intelligence tools */
+  codeIntelligence?: CodeIntelligenceService
+  /** versioned hybrid repository index used by Code RAG tools */
+  codeRetriever?: CodeRetriever
+  /** true only while a low-impact replan is waiting for one bounded repair */
+  canLocalPlanRepair?: () => boolean
   /** interactive question channel to the human user */
   askUser?: (input: { question: string; options?: string[] }) => Promise<string>
   /** human approval UI for a persisted plan version */
@@ -99,12 +109,26 @@ export interface ToolDefinition<Input = unknown, Output = unknown> {
   interruptBehavior(input: Input): InterruptBehavior
 
   validate(input: Input, ctx: ToolContext): Promise<ValidationResult>
+  /** Runtime-enforced assertions evaluated immediately before execution. */
+  preconditions(input: Input, ctx: ToolContext): Promise<ToolContractCheck[]>
   permission(input: Input, ctx: ToolContext): Promise<ToolPermissionHint>
   execute(
     input: Input,
     ctx: ToolContext,
     progress: (value: unknown) => void,
   ): Promise<ToolExecutionResult<Output>>
+  /** Runtime-enforced assertions evaluated after execute and before commit. */
+  postconditions(
+    input: Input,
+    output: Output,
+    ctx: ToolContext,
+  ): Promise<ToolContractCheck[]>
+  /** Stable structured observation; never require consumers to parse prose. */
+  observe(
+    input: Input,
+    output: Output,
+    ctx: ToolContext,
+  ): Promise<Omit<ToolObservation, 'preconditions' | 'postconditions'>>
   serialize(output: Output, callId: string): ToolResultContent
   /**
    * Adjudication probe (finish-list §1.4): re-check external state against
@@ -136,12 +160,28 @@ export interface ToolSpec<Input, Output> {
   resources?: (input: Input, ctx: ToolContext) => ResourceClaim[]
   interruptBehavior?: (input: Input) => InterruptBehavior
   validate?: (input: Input, ctx: ToolContext) => Promise<ValidationResult>
+  preconditions?: (
+    input: Input,
+    ctx: ToolContext,
+  ) => Promise<ToolContractCheck[]>
   permission?: (input: Input, ctx: ToolContext) => Promise<ToolPermissionHint>
   execute: (
     input: Input,
     ctx: ToolContext,
     progress: (value: unknown) => void,
   ) => Promise<ToolExecutionResult<Output>>
+  postconditions?: (
+    input: Input,
+    output: Output,
+    ctx: ToolContext,
+  ) => Promise<ToolContractCheck[]>
+  observe?: (
+    input: Input,
+    output: Output,
+    ctx: ToolContext,
+  ) =>
+    | Omit<ToolObservation, 'preconditions' | 'postconditions'>
+    | Promise<Omit<ToolObservation, 'preconditions' | 'postconditions'>>
   serialize?: (output: Output, callId: string) => ToolResultContent
   inspectOutcome?: (
     input: Input,
@@ -166,8 +206,14 @@ export function defineTool<Input, Output>(
       spec.resources ?? (() => [{ resource: 'workspace:*', mode: 'write' }]),
     interruptBehavior: spec.interruptBehavior ?? (() => 'block'),
     validate: spec.validate ?? (async () => ({ ok: true })),
+    preconditions: spec.preconditions ?? (async () => []),
     permission: spec.permission ?? (async () => ({ behavior: 'ask' })),
     execute: spec.execute,
+    postconditions: spec.postconditions ?? (async () => []),
+    observe: async (input, output, ctx) =>
+      spec.observe
+        ? spec.observe(input, output, ctx)
+        : { summary: `${spec.name} completed` },
     serialize:
       spec.serialize ??
       ((output: Output): ToolResultContent => ({

@@ -1,0 +1,32 @@
+[
+  {
+    "id": "runtime-pipeline",
+    "query": "tool execution pipeline schema permission precondition postcondition",
+    "expectedUris": ["src/tools/ToolRuntime.ts"]
+  },
+  {
+    "id": "recovery-replay",
+    "query": "strict session recovery snapshot replay orphan tool calls",
+    "expectedUris": ["src/app/createRuntime.ts", "src/session/SessionLoader.ts"]
+  },
+  {
+    "id": "context-compaction",
+    "query": "context compaction token budget prompt too long circuit breaker",
+    "expectedUris": ["src/context/ContextManager.ts"]
+  },
+  {
+    "id": "plan-approval",
+    "query": "versioned plan approval token expiry",
+    "expectedUris": ["src/planning/PlanStore.ts"]
+  },
+  {
+    "id": "hybrid-retrieval",
+    "query": "BM25 local vector reciprocal rank fusion retrieval",
+    "expectedUris": ["src/retrieval/CodeRetriever.ts"]
+  },
+  {
+    "id": "secret-sanitization",
+    "query": "credential secret sanitization redaction outbound sink",
+    "expectedUris": ["src/security/secrets.ts"]
+  }
+]

@@ -2,6 +2,7 @@ import type { AgentState } from '../core/state.js'
 import type { AcceptanceCriterion, PlanVersion } from './types.js'
 import type { EvidenceReceipt } from '../verification/types.js'
 import { requiredCriteriaWithoutUsableEvidence } from '../verification/criteriaEvidence.js'
+import { tasksForPlan } from './PlanSupervisor.js'
 
 export interface CompletionRequirement {
   kind:
@@ -9,6 +10,8 @@ export interface CompletionRequirement {
     | 'missing_evidence'
     | 'manual_verification_required'
     | 'blocked_tasks'
+    | 'failed_tasks'
+    | 'replan_in_progress'
   detail: string
 }
 
@@ -41,8 +44,18 @@ export function evaluateCompletion(input: {
   const { state, approvedPlan, evidence } = input
   const missing: CompletionRequirement[] = []
 
+  if (state.recovery.replanning) {
+    missing.push({
+      kind: 'replan_in_progress',
+      detail: state.recovery.replanAwaitingApproval
+        ? 'a replacement plan is still awaiting approval'
+        : 'a durable low-impact plan adjustment is still open',
+    })
+  }
+
   // 1. open tasks
-  const open = state.tasks.filter(
+  const currentTasks = tasksForPlan(state.tasks, approvedPlan)
+  const open = currentTasks.filter(
     t => t.status === 'pending' || t.status === 'in_progress',
   )
   if (open.length > 0) {
@@ -51,13 +64,20 @@ export function evaluateCompletion(input: {
       detail: `open tasks: ${open.map(t => `${t.id}(${t.status})`).join(', ')}`,
     })
   }
-  const blocked = state.tasks.filter(t => t.status === 'blocked')
+  const blocked = currentTasks.filter(t => t.status === 'blocked')
   if (blocked.length > 0) {
     missing.push({
       kind: 'blocked_tasks',
       detail: `blocked tasks: ${blocked
         .map(t => `${t.id}: ${t.blockedReason ?? 'no reason'}`)
         .join('; ')}`,
+    })
+  }
+  const failed = currentTasks.filter(t => t.status === 'failed')
+  if (failed.length > 0) {
+    missing.push({
+      kind: 'failed_tasks',
+      detail: `failed tasks: ${failed.map(t => t.id).join(', ')}`,
     })
   }
 
@@ -100,8 +120,8 @@ export function evaluateCompletion(input: {
       message:
         'Completion gate: the run is not finishable yet.\n' +
         missing.map(m => `- [${m.kind}] ${m.detail}`).join('\n') +
-        '\nEither finish the work (with evidence) or mark tasks blocked/failed ' +
-        'with honest reasons, then summarize the true state.',
+        '\nRepair or replan failed/blocked work and attach the required evidence; ' +
+        'do not claim completion while these requirements remain.',
     }
   }
 

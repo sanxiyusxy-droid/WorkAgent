@@ -1,0 +1,30 @@
+[
+  {
+    "id": "runtime-imports-retriever",
+    "seedQuery": "CodeRetriever composition root",
+    "seedUri": "src/app/createRuntime.ts",
+    "expectedUri": "src/retrieval/CodeRetriever.ts",
+    "relations": ["imports"]
+  },
+  {
+    "id": "tool-runtime-imports-contract",
+    "seedQuery": "ToolRuntime class",
+    "seedUri": "src/tools/ToolRuntime.ts",
+    "expectedUri": "src/tools/Tool.ts",
+    "relations": ["imports"]
+  },
+  {
+    "id": "retrieval-tool-imports-service",
+    "seedQuery": "SearchCodeIndex tool",
+    "seedUri": "src/tools/builtin/RetrievalTools.ts",
+    "expectedUri": "src/retrieval/CodeRetriever.ts",
+    "relations": ["imports"]
+  },
+  {
+    "id": "engine-imports-loop-intelligence",
+    "seedQuery": "AgentEngine loop intelligence",
+    "seedUri": "src/core/AgentEngine.ts",
+    "expectedUri": "src/core/LoopIntelligence.ts",
+    "relations": ["imports"]
+  }
+]

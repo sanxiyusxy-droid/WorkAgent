@@ -71,6 +71,103 @@ export class PlanStore {
     return plan
   }
 
+  /**
+   * Create an approval-preserving plan version that replaces exactly one
+   * step. Scope cannot expand: replacement files must already appear in the
+   * approved plan, dependencies and acceptance criteria remain unchanged.
+   */
+  async createLocalRepair(input: {
+    planId: string
+    version: number
+    stepId: string
+    reason: string
+    replacement: {
+      title?: string
+      description: string
+      files?: string[]
+      expectedOutcome?: string
+    }
+  }): Promise<{ previous: PlanVersion; plan: PlanVersion }> {
+    const previous = this.mustGet(input.planId, input.version)
+    if (previous.status !== 'approved' || this.lastApprovedRef !== previous) {
+      throw new InvariantError(
+        'local_repair_requires_active_approved_plan',
+        `plan ${input.planId}@${input.version} is not the active approved plan`,
+      )
+    }
+    const stepIndex = previous.steps.findIndex(step => step.id === input.stepId)
+    if (stepIndex < 0) {
+      throw new InvariantError(
+        'local_repair_step_not_found',
+        `step ${input.stepId} is not in plan ${input.planId}@${input.version}`,
+      )
+    }
+    const oldStep = previous.steps[stepIndex]!
+    const files = input.replacement.files ?? oldStep.files
+    const approvedFiles = new Set(previous.steps.flatMap(step => step.files))
+    const expanded = files.filter(file => !approvedFiles.has(file))
+    if (expanded.length > 0) {
+      throw new InvariantError(
+        'local_repair_scope_expansion',
+        `local repair cannot add files outside approved scope: ${expanded.join(', ')}`,
+      )
+    }
+
+    const existing = this.plans.get(input.planId) ?? []
+    const repairedStep = {
+      ...oldStep,
+      title: input.replacement.title ?? oldStep.title,
+      description: input.replacement.description,
+      files: [...files],
+      expectedOutcome:
+        input.replacement.expectedOutcome ?? oldStep.expectedOutcome,
+    }
+    const plan: PlanVersion = {
+      ...previous,
+      version: existing.length + 1,
+      status: 'approved',
+      steps: previous.steps.map((step, index) =>
+        index === stepIndex ? repairedStep : { ...step, files: [...step.files], dependsOn: [...step.dependsOn] },
+      ),
+      nonGoals: [...previous.nonGoals],
+      assumptions: [...previous.assumptions],
+      decisions: previous.decisions.map(item => ({ ...item })),
+      acceptanceCriteria: previous.acceptanceCriteria.map(item => ({ ...item })),
+      risks: [...previous.risks],
+      createdAt: this.deps.clock.isoNow(),
+      approvedAt: this.deps.clock.isoNow(),
+      localRepair: {
+        fromVersion: previous.version,
+        stepId: input.stepId,
+        reason: input.reason,
+        authorization: 'bounded_local_repair',
+      },
+    }
+
+    previous.status = 'superseded'
+    existing.push(plan)
+    this.plans.set(input.planId, existing)
+    this.lastApprovedRef = plan
+
+    if (this.deps.persist !== false) {
+      const dir = join(this.deps.artifactDir, 'plans')
+      await mkdir(dir, { recursive: true })
+      await Promise.all([
+        writeFile(
+          join(dir, `${previous.planId}-v${previous.version}.json`),
+          JSON.stringify(previous, null, 2),
+          'utf8',
+        ),
+        writeFile(
+          join(dir, `${plan.planId}-v${plan.version}.json`),
+          JSON.stringify(plan, null, 2),
+          'utf8',
+        ),
+      ])
+    }
+    return { previous, plan }
+  }
+
   get(planId: string, version: number): PlanVersion | undefined {
     return this.plans.get(planId)?.find(p => p.version === version)
   }

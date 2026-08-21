@@ -30,7 +30,7 @@ const READONLY_COMMANDS = new Set([
 ])
 
 const GIT_READONLY_SUBCOMMANDS = new Set([
-  'status', 'log', 'diff', 'show', 'remote', 'ls-files', 'blame', 'rev-parse',
+  'status', 'log', 'diff', 'show', 'ls-files', 'blame', 'rev-parse',
 ])
 
 /**
@@ -144,13 +144,37 @@ export function analyzeShellCommand(command: string): ShellAnalysis {
 
   if (head === 'git') {
     const sub = argv[1]?.toLowerCase()
+    const args = argv.slice(2)
+    const outputBearing = args.some(arg =>
+      arg === '--output' ||
+      arg.startsWith('--output=') ||
+      arg === '--ext-diff' ||
+      arg === '--textconv',
+    )
+    if (outputBearing) {
+      return {
+        classification: 'write',
+        argv,
+        reason: `git ${sub ?? ''} may write output or execute a diff helper`,
+      }
+    }
+    if (sub === 'remote') {
+      const readonlyRemote =
+        args.length === 0 ||
+        (args.length === 1 && args[0] === '-v') ||
+        (args[0] === 'show' && args.slice(1).every(arg => !arg.startsWith('-')))
+      return readonlyRemote
+        ? { classification: 'readonly', argv }
+        : { classification: 'write', argv, reason: 'git remote mutation' }
+    }
     if (sub && GIT_READONLY_SUBCOMMANDS.has(sub)) {
       return { classification: 'readonly', argv }
     }
-    // conditional subcommands: read-only only if no dangerous flags present
+    // Conditional subcommands are read-only only for an explicit small argv
+    // grammar. Positional names such as `git branch new` / `git tag v1` write.
     if (sub && GIT_CONDITIONAL_SUBCOMMANDS[sub]) {
-      const { dangerousFlags } = GIT_CONDITIONAL_SUBCOMMANDS[sub]
-      const hasDangerous = argv.slice(2).some(arg => dangerousFlags.has(arg))
+      const { safeFlags, dangerousFlags } = GIT_CONDITIONAL_SUBCOMMANDS[sub]
+      const hasDangerous = args.some(arg => dangerousFlags.has(arg))
       if (hasDangerous) {
         return {
           classification: 'write',
@@ -158,7 +182,12 @@ export function analyzeShellCommand(command: string): ShellAnalysis {
           reason: `git ${sub} with destructive flag`,
         }
       }
-      return { classification: 'readonly', argv }
+      const readonlyConditional = sub === 'stash'
+        ? args.length > 0 && (args[0] === 'list' || args[0] === 'show')
+        : args.length === 0 || args.every(arg => safeFlags.has(arg))
+      return readonlyConditional
+        ? { classification: 'readonly', argv }
+        : { classification: 'write', argv, reason: `git ${sub} may mutate refs or state` }
     }
     return { classification: 'write', argv, reason: `git ${sub ?? ''} may write` }
   }
@@ -181,7 +210,13 @@ export function analyzeShellCommand(command: string): ShellAnalysis {
 
   // check dangerous arguments on otherwise read-only commands
   if (head === 'find') {
-    const dangerousArg = argv.slice(1).find(arg => DANGEROUS_ARGUMENTS['find']!.has(arg))
+    const dangerousArg = argv.slice(1).find(arg =>
+      DANGEROUS_ARGUMENTS['find']!.has(arg) ||
+      arg === '-fprint' ||
+      arg === '-fprint0' ||
+      arg === '-fprintf' ||
+      arg === '-fls',
+    )
     if (dangerousArg) {
       return {
         classification: 'dangerous',
@@ -190,6 +225,57 @@ export function analyzeShellCommand(command: string): ShellAnalysis {
       }
     }
     return { classification: 'readonly', argv }
+  }
+
+  if (head === 'rg') {
+    const unsafe = argv.slice(1).find(arg =>
+      arg === '--pre' || arg.startsWith('--pre='),
+    )
+    if (unsafe) {
+      return {
+        classification: 'dangerous',
+        argv,
+        reason: `rg may execute a preprocessor: ${unsafe}`,
+      }
+    }
+  }
+
+  if (head === 'date') {
+    const args = argv.slice(1)
+    const readonlyDate = args.length === 0 || args.every(arg =>
+      arg === '/T' ||
+      arg === '-u' ||
+      arg === '--utc' ||
+      arg === '--universal' ||
+      arg === '-R' ||
+      arg === '--rfc-email' ||
+      arg.startsWith('+') ||
+      arg.startsWith('--iso-8601=') ||
+      arg.startsWith('--rfc-3339=') ||
+      arg.startsWith('--date=') ||
+      arg.startsWith('--reference='),
+    )
+    if (!readonlyDate) {
+      return {
+        classification: 'dangerous',
+        argv,
+        reason: 'date arguments are outside the audited read-only grammar',
+      }
+    }
+  }
+
+  if (head === 'file') {
+    const compileFlag = argv.slice(1).find(arg =>
+      arg === '--compile' ||
+      (/^-[^-]+$/.test(arg) && arg.slice(1).includes('C')),
+    )
+    if (compileFlag) {
+      return {
+        classification: 'dangerous',
+        argv,
+        reason: `file may compile and write a magic database: ${compileFlag}`,
+      }
+    }
   }
 
   if (READONLY_COMMANDS.has(head)) {

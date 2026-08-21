@@ -3,6 +3,8 @@ import type {
   StructuredToolError,
   ToolCall,
   ToolCallResult,
+  ToolContractCheck,
+  ToolObservation,
 } from '../core/messages.js'
 import type { AgentEvent } from '../core/events.js'
 import type { AgentMode } from '../core/events.js'
@@ -13,6 +15,11 @@ import type { PolicyEngine } from '../policy/PolicyEngine.js'
 import type { Clock, IdGenerator } from '../core/runtimePrimitives.js'
 import { IdempotencyLedger } from './IdempotencyLedger.js'
 import { ProgressThrottle, type ProgressChunk } from './toolProgress.js'
+import { redactDeep } from '../security/secrets.js'
+import {
+  validateToolInputForLane,
+  type ToolExecutionLane,
+} from '../planning/ToolExecutionLane.js'
 
 export interface ExecuteToolRequest {
   call: ToolCall
@@ -21,6 +28,9 @@ export interface ExecuteToolRequest {
   workspaceRoot: string
   artifactDir: string
   signal: AbortSignal
+  /** Frozen projection used for both model schemas and this exact batch. */
+  lane?: Readonly<ToolExecutionLane>
+  writeLocked?: boolean
   /**
    * Side channel for transient events (live tool progress). Bypasses the
    * scheduler buffer so long-running commands stream in real time; these
@@ -68,28 +78,48 @@ export class ToolRuntime {
         message: `unknown tool: ${req.call.name}`,
         retryable: true,
         hint: `Available tools: ${this.deps.registry
-          .availableFor(req.mode)
+          .availableFor(req.mode, { writeLocked: req.writeLocked, lane: req.lane })
           .map(t => t.name)
           .join(', ')}`,
       })
       return
     }
 
-    // 1. mode projection: a tool hidden from the current mode must not reach
-    // the permission layer, and the refusal must say what to do instead.
-    if (!this.deps.registry.isAvailableIn(tool.name, req.mode)) {
+    // 1. projection guards: mode, frozen write lock and action lane are
+    // checked independently so error semantics stay precise. The action lane
+    // is allow-list based and therefore fails closed even if blockedTools in a
+    // reconstructed/audit object is incomplete.
+    const modeAvailable = this.deps.registry.isAvailableIn(tool.name, req.mode)
+    const lockedAvailable = this.deps.registry.isAvailableIn(tool.name, req.mode, {
+      writeLocked: req.writeLocked,
+    })
+    const actionRefused = Boolean(req.lane && !req.lane.allowedTools.includes(tool.name))
+    if (!modeAvailable || !lockedAvailable || actionRefused) {
+      const lockRefused = modeAvailable && !lockedAvailable
       yield this.completed(req, startedAt, {
-        code: 'TOOL_NOT_AVAILABLE_IN_MODE',
-        message: `${tool.name} is not available in ${req.mode} mode`,
-        retryable: false,
+        code: !modeAvailable
+          ? 'TOOL_NOT_AVAILABLE_IN_MODE'
+          : lockRefused
+            ? 'REPLAN_APPROVAL_PENDING'
+            : 'TOOL_NOT_AVAILABLE_FOR_ACTION',
+        message: !modeAvailable
+          ? `${tool.name} is not available in ${req.mode} mode`
+          : lockRefused
+            ? `write access is suspended: ${tool.name} is outside the frozen write-lock projection until the revised plan is approved`
+            : `${tool.name} is not available while the supervisor action is ${req.lane!.action} (projection ${req.lane!.hash})`,
+        retryable: modeAvailable,
         hint:
-          req.mode === 'plan'
+          lockRefused
+            ? 'Propose the revised plan with PlanPropose and request approval via ExitPlanMode.'
+            : actionRefused
+            ? `${req.lane!.instruction} Available tools: ${req.lane!.allowedTools.join(', ') || '(none)'}`
+            : req.mode === 'plan'
             ? 'Plan mode is read-only. Persist the plan with PlanPropose, then ' +
               'call ExitPlanMode to request approval — approval restores the ' +
               'previous mode automatically and you continue executing. Do not ' +
               'ask the user to switch modes manually.'
             : `Available tools: ${this.deps.registry
-                .availableFor(req.mode)
+                .availableFor(req.mode, { writeLocked: req.writeLocked, lane: req.lane })
                 .map(t => t.name)
                 .join(', ')}`,
       })
@@ -100,6 +130,12 @@ export class ToolRuntime {
     const parsed = tool.inputSchema.safeParse(req.call.input)
     if (!parsed.success) {
       yield this.completed(req, startedAt, zodToError(parsed.error))
+      return
+    }
+
+    const laneInputError = validateToolInputForLane(req.lane, tool.name, parsed.data)
+    if (laneInputError) {
+      yield this.completed(req, startedAt, laneInputError)
       return
     }
 
@@ -142,6 +178,41 @@ export class ToolRuntime {
             ? `blocked by hard safety rule: ${decision.reason.rule}`
             : 'The user declined or policy denied this action.',
       })
+      return
+    }
+
+    const effectiveInput =
+      decision.updatedInput !== undefined
+        ? (decision.updatedInput as never)
+        : parsed.data
+
+    // 4a. runtime contract preconditions. These are deliberately separate
+    // from schema/semantic validation: they describe live state that must be
+    // true at the exact execution boundary.
+    let preconditions: ToolContractCheck[]
+    try {
+      preconditions = await tool.preconditions(effectiveInput, ctx)
+    } catch (error) {
+      yield this.completed(req, startedAt, classifyToolError(error))
+      return
+    }
+    const failedPreconditions = failedChecks(preconditions)
+    if (failedPreconditions.length > 0) {
+      yield this.completed(
+        req,
+        startedAt,
+        {
+          code: 'PRECONDITION_FAILED',
+          message: `tool preconditions failed: ${formatChecks(failedPreconditions)}`,
+          retryable: true,
+          hint: 'Refresh the relevant workspace state, then retry with updated input.',
+        },
+        contractObservation(
+          `${tool.name} was not executed because its preconditions failed`,
+          preconditions,
+          [],
+        ),
+      )
       return
     }
 
@@ -282,9 +353,7 @@ export class ToolRuntime {
 
     try {
       const output = await tool.execute(
-        decision.updatedInput !== undefined
-          ? (decision.updatedInput as never)
-          : parsed.data,
+        effectiveInput,
         ctx,
         data => {
           // progress is transient by design: streamed to the UI, never
@@ -301,6 +370,58 @@ export class ToolRuntime {
         },
       )
       throttle?.flush()
+      const postconditions = await tool.postconditions(effectiveInput, output.data, ctx)
+      let observed: Omit<ToolObservation, 'preconditions' | 'postconditions'>
+      try {
+        observed = await tool.observe(effectiveInput, output.data, ctx)
+      } catch (error) {
+        // Observation enriches policy but must never turn a successful tool
+        // into an unknown side effect. Record the instrumentation defect.
+        observed = {
+          summary: `${tool.name} completed; structured observation failed`,
+          fields: {
+            observationError: error instanceof Error ? error.message : String(error),
+          },
+        }
+      }
+      const observation = contractObservation(
+        observed.summary,
+        preconditions,
+        postconditions,
+        observed.fields,
+      )
+      const failedPostconditions = failedChecks(postconditions)
+      if (failedPostconditions.length > 0) {
+        // execute may already have changed external state. Keep the ledger
+        // fail-closed and persist tool-declared workspace facts before
+        // returning the contract failure.
+        if (idempotencyKey) {
+          this.idempotency.markUnknown(idempotencyKey, this.deps.clock.isoNow())
+          await this.idempotency.flush()
+        }
+        if (output.facts) {
+          for (const fact of output.facts) {
+            if (fact.type === 'workspace.changed') {
+              this.deps.services?.evidence?.bumpWorkspaceRevision(fact.path)
+              this.deps.services?.codeIntelligence?.invalidate(fact.path)
+              this.deps.services?.codeRetriever?.invalidate(fact.path)
+            }
+            yield fact
+          }
+        }
+        yield this.completed(
+          req,
+          startedAt,
+          {
+            code: 'POSTCONDITION_FAILED',
+            message: `tool postconditions failed: ${formatChecks(failedPostconditions)}`,
+            retryable: true,
+            hint: 'Inspect current state before retrying; the side effect may have been applied.',
+          },
+          observation,
+        )
+        return
+      }
       // 6. serialize + output budget
       const content = tool.serialize(output.data, req.call.id)
       const bounded = await this.deps.outputStore.bound(content, {
@@ -314,6 +435,7 @@ export class ToolRuntime {
         ok: true,
         content: bounded,
         durationMs: this.deps.clock.now() - startedAt,
+        observation,
       }
       // mark committed after successful side effect, storing the commit proof
       if (idempotencyKey) {
@@ -327,6 +449,8 @@ export class ToolRuntime {
             // the workspace moved on: receipts signed for the previous
             // revision become stale (finish-list §1.6)
             this.deps.services?.evidence?.bumpWorkspaceRevision(fact.path)
+            this.deps.services?.codeIntelligence?.invalidate(fact.path)
+            this.deps.services?.codeRetriever?.invalidate(fact.path)
           }
           yield fact
         }
@@ -349,6 +473,7 @@ export class ToolRuntime {
     req: ExecuteToolRequest,
     startedAt: number,
     error: StructuredToolError,
+    observation?: ToolObservation,
   ): AgentEvent {
     const result: ToolCallResult = {
       callId: req.call.id,
@@ -357,6 +482,7 @@ export class ToolRuntime {
       content: { kind: 'json', value: { ok: false, error } },
       errorCode: error.code,
       durationMs: this.deps.clock.now() - startedAt,
+      observation,
     }
     return { type: 'tool.call.completed', result }
   }
@@ -405,6 +531,49 @@ export class ToolRuntime {
   }
 }
 
+function failedChecks(checks: ToolContractCheck[]): ToolContractCheck[] {
+  return checks.filter(check => !check.passed)
+}
+
+function formatChecks(checks: ToolContractCheck[]): string {
+  return checks
+    .map(check => `${check.id}${check.detail ? ` (${check.detail})` : ''}`)
+    .join(', ')
+}
+
+function contractObservation(
+  summary: string,
+  preconditions: ToolContractCheck[],
+  postconditions: ToolContractCheck[],
+  fields?: Record<string, unknown>,
+): ToolObservation {
+  const observation = redactDeep({
+    summary,
+    preconditions,
+    postconditions,
+    ...(fields ? { fields } : {}),
+  })
+  const encoded = JSON.stringify(observation)
+  if (encoded.length <= 16_000) return observation
+  return {
+    summary: observation.summary.slice(0, 1_000),
+    preconditions: observation.preconditions.map(boundCheck),
+    postconditions: observation.postconditions.map(boundCheck),
+    fields: {
+      observationTruncated: true,
+      originalChars: encoded.length,
+    },
+  }
+}
+
+function boundCheck(check: ToolContractCheck): ToolContractCheck {
+  return {
+    id: check.id.slice(0, 200),
+    passed: check.passed,
+    ...(check.detail ? { detail: check.detail.slice(0, 500) } : {}),
+  }
+}
+
 function zodToError(error: ZodError): StructuredToolError {
   return {
     code: 'INPUT_VALIDATION_ERROR',
@@ -426,7 +595,9 @@ export function classifyToolError(error: unknown): StructuredToolError {
       code: err.toolErrorCode,
       message: err.message,
       retryable: err.toolErrorCode === 'FILE_VERSION_CONFLICT' ||
-        err.toolErrorCode === 'SEMANTIC_VALIDATION_ERROR',
+        err.toolErrorCode === 'SEMANTIC_VALIDATION_ERROR' ||
+        err.toolErrorCode === 'PRECONDITION_FAILED' ||
+        err.toolErrorCode === 'POSTCONDITION_FAILED',
       hint:
         err.toolErrorCode === 'FILE_VERSION_CONFLICT'
           ? 'Re-read the file to get the current version, then retry the edit.'

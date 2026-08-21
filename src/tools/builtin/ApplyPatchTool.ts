@@ -260,6 +260,45 @@ export const ApplyPatchTool = defineTool<
     }
   },
 
+  postconditions: async (_input, output, ctx) => Promise.all(
+    output.applied.map(async applied => {
+      const check = await checkPathReal(applied.path, ctx.workspaceRoot)
+      if (!check.ok) {
+        return {
+          id: `version-committed:${applied.path}`,
+          passed: false,
+          detail: check.reason,
+        }
+      }
+      try {
+        const current = await readFileVersion(check.resolved)
+        return {
+          id: `version-committed:${applied.path}`,
+          passed: current.version === applied.newVersion,
+          detail: current.version,
+        }
+      } catch {
+        return {
+          id: `version-committed:${applied.path}`,
+          passed: false,
+          detail: 'file disappeared',
+        }
+      }
+    }),
+  ),
+
+  observe: async (_input, output) => ({
+    summary: `Applied an atomic patch to ${output.applied.length} files`,
+    fields: {
+      fileCount: output.applied.length,
+      files: output.applied.map(item => ({
+        path: item.path,
+        action: item.action,
+        newVersion: item.newVersion,
+      })),
+    },
+  }),
+
   serialize: output => ({
     kind: 'text',
     text:

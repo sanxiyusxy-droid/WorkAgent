@@ -119,6 +119,34 @@ export const ReadTool = defineTool<z.infer<typeof ReadInput>, ReadOutput>({
     }
   },
 
+  postconditions: async (_input, output, ctx) => {
+    const check = await checkPathReal(output.path, ctx.workspaceRoot, { read: true })
+    if (!check.ok) {
+      return [{ id: 'file-version-observed', passed: false, detail: check.reason }]
+    }
+    try {
+      const current = await readFileVersion(check.resolved)
+      return [{
+        id: 'file-version-observed',
+        passed: current.version === output.fileVersion,
+        detail: current.version,
+      }]
+    } catch {
+      return [{ id: 'file-version-observed', passed: false, detail: 'file disappeared' }]
+    }
+  },
+
+  observe: async (_input, output) => ({
+    summary: `Read ${output.returnedLines} of ${output.totalLines} lines from ${output.path}`,
+    fields: {
+      path: output.path,
+      fileVersion: output.fileVersion,
+      returnedLines: output.returnedLines,
+      totalLines: output.totalLines,
+      truncated: output.truncated,
+    },
+  }),
+
   serialize: output => ({
     kind: 'text',
     text:

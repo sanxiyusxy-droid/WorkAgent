@@ -21,7 +21,7 @@ import {
   type ModelFileConfig,
 } from '../app/config.js'
 import type { AgentMode, FactEvent, TerminalReason } from '../core/events.js'
-import type { AgentState } from '../core/state.js'
+import { reduce, type AgentState } from '../core/state.js'
 import { driveTurn } from './turnRunner.js'
 import { IdempotencyLedgerError } from '../tools/IdempotencyLedger.js'
 import type { ModelGateway } from '../model/types.js'
@@ -345,7 +345,7 @@ async function main(): Promise<void> {
     )
     const probe = await loadSession(probeJournalPath)
     if (probe.envelopes.length > 0 || probe.diagnostics.some(d => !d.startsWith('journal not found'))) {
-      const diagnosis = diagnoseSession(probe)
+      const diagnosis = diagnoseSession(probe, workspaceRoot)
       if (!diagnosis.ok) {
         if (!args.allowDegraded) {
           printRecoveryRefusal({ sessionId, journalPath: probeJournalPath, diagnosis })
@@ -382,6 +382,8 @@ async function main(): Promise<void> {
       rules: effective.rules,
       verification: effective.verification,
       context: effective.context,
+      intelligence: effective.intelligence,
+      replan: effective.replan,
       configHash: effective.configHash,
       recoveryForkFrom,
     },
@@ -479,6 +481,7 @@ async function main(): Promise<void> {
           .map(issue => `[${issue.kind}] ${issue.location} ${issue.invariant}`),
       }
       await runtime.journal?.append(branchFact, state.turnId, 'flush')
+      state = reduce(state, branchFact)
       resumedNote =
         `${resumedNote ?? ''} (degraded recovery branch from ${recoveryForkFrom}, read-only)`.trim()
     }
@@ -540,12 +543,15 @@ async function main(): Promise<void> {
     )
     const userFact: FactEvent = { type: 'user.message.accepted', message: userMessage }
     await runtime.journal?.append(userFact, state.turnId, 'flush')
+    state = reduce(state, userFact)
     state = {
       ...state,
-      messages: [...state.messages, userMessage],
       iteration: 0,
       turnId: runtime.ids.next('turn'),
-      recovery: { ...state.recovery, stopHookRetries: 0, verifierRepairs: 0 },
+      // stop-hook retries are turn-local. verifierRepairs is deliberately
+      // durable: an interrupted verifier repair must survive a CLI follow-up
+      // until PASS, replan, or another explicit state transition closes it.
+      recovery: { ...state.recovery, stopHookRetries: 0 },
       budget: {
         ...state.budget,
         used: { ...state.budget.used, startedAt: runtime.clock.now() },

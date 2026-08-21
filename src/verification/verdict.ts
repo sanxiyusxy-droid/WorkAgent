@@ -92,6 +92,12 @@ export function validateReport(
 
   // 2. semantic: PASS checks must only reference evidence with status 'passed'
   if (report.verdict === 'PASS') {
+    if (report.failures.length > 0 || report.unverified.length > 0) {
+      return {
+        ok: false,
+        reason: 'PASS cannot contain failures or unverified items',
+      }
+    }
     for (const check of report.checks) {
       if (check.result !== 'PASS') continue
       for (const evId of check.evidenceIds) {

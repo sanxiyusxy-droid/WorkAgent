@@ -1,7 +1,23 @@
 {
   "name": "code-agent",
-  "version": "1.0.0-rc.3",
+  "version": "1.8.0",
   "description": "A resumable, contract-driven CLI code agent",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sanxiyusxy-droid/WorkAgent.git"
+  },
+  "homepage": "https://github.com/sanxiyusxy-droid/WorkAgent#readme",
+  "bugs": {
+    "url": "https://github.com/sanxiyusxy-droid/WorkAgent/issues"
+  },
+  "author": "sanxiyusxy-droid",
+  "keywords": [
+    "code-agent",
+    "agent-runtime",
+    "tool-calling",
+    "code-rag",
+    "event-sourcing"
+  ],
   "license": "MIT",
   "type": "module",
   "bin": {
@@ -25,7 +41,12 @@
     "secret-scan": "node scripts/secret-scan.mjs",
     "check:package": "node scripts/check-package.mjs",
     "prepack": "npm run typecheck && npm test && npm run secret-scan && npm run build && npm run check:package",
-    "eval": "tsx eval/run-eval.ts",
+    "eval": "tsx eval/agent-eval.ts",
+    "eval:agent": "tsx eval/agent-eval.ts",
+    "eval:faults": "tsx eval/agent-eval.ts --faults-only",
+    "eval:live": "tsx eval/run-eval.ts",
+    "eval:retrieval": "tsx eval/retrieval-eval.ts",
+    "eval:all": "npm run eval:agent && npm run eval:retrieval",
     "smoke:anthropic": "tsx scripts/smoke-anthropic.ts",
     "precommit": "node scripts/secret-scan.mjs"
   },

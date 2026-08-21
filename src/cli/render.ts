@@ -229,7 +229,8 @@ export class Renderer {
           // always worth showing; other hints stay behind --debug
           const alwaysHint =
             result.errorCode === 'PERMISSION_DENIED' ||
-            result.errorCode === 'TOOL_NOT_AVAILABLE_IN_MODE'
+            result.errorCode === 'TOOL_NOT_AVAILABLE_IN_MODE' ||
+            result.errorCode === 'TOOL_NOT_AVAILABLE_FOR_ACTION'
           if ((alwaysHint || this.options.debug) && payload.error?.hint) {
             this.line(indent(style.gray(payload.error.hint), '     '))
           }
@@ -315,6 +316,73 @@ export class Renderer {
             `${symbol.plan} replan adjusted (${event.cause}): ${oneLine(event.summary, 80)}`,
           ),
         )
+        return
+
+      case 'loop.stagnation.detected':
+        this.line(
+          style.yellow(
+            `${symbol.info} stagnation detected (${event.record.kind}): ` +
+              oneLine(event.record.detail, 100),
+          ),
+        )
+        return
+
+      case 'reflection.recorded':
+        if (this.options.debug) {
+          this.line(
+            style.gray(
+              `${symbol.info} reflection ${event.reflection.id} ` +
+                `[${event.reflection.trigger}]: ` +
+                oneLine(event.reflection.recommendation, 100),
+            ),
+          )
+        }
+        return
+
+      case 'reflection.evaluated':
+        if (this.options.debug || event.evaluation.outcome === 'ineffective') {
+          const paint = event.evaluation.outcome === 'effective' ? style.gray : style.yellow
+          this.line(
+            paint(
+              `${symbol.info} reflection ${event.evaluation.reflectionId} ` +
+                `${event.evaluation.outcome} after ${event.evaluation.toolCallsObserved} tool call(s): ` +
+                oneLine(event.evaluation.followUp.rationale, 100),
+            ),
+          )
+        }
+        return
+
+      case 'plan.health.assessed':
+        if (this.options.debug || event.assessment.status === 'blocked') {
+          const paint = event.assessment.status === 'blocked' ? style.yellow : style.gray
+          this.line(
+            paint(
+              `${symbol.plan} plan health ${event.assessment.status} ` +
+                `${event.assessment.score}/100: ${event.assessment.decision.action}`,
+            ),
+          )
+        }
+        return
+
+      case 'strategy.adapted':
+        this.line(
+          style.yellow(
+            `${symbol.info} strategy ${event.from} ${symbol.arrow} ${event.to}: ` +
+              oneLine(event.reason, 100),
+          ),
+        )
+        return
+
+      case 'model.attempt.failed':
+        if (this.options.debug || event.failure.action === 'surface') {
+          this.line(
+            style.yellow(
+              `${symbol.info} model attempt ${event.failure.attempt} ` +
+                `${event.failure.code} -> ${event.failure.action}` +
+                (event.failure.delayMs > 0 ? ` (${event.failure.delayMs}ms)` : ''),
+            ),
+          )
+        }
         return
 
       case 'tool.progress': {

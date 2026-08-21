@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { makeWorld, stateWithUser, type TestWorld } from './helpers.js'
 import { driveTurn } from '../src/cli/turnRunner.js'
 import { textTurn, toolCallTurn } from '../src/model/ScriptedModel.js'
-import { applyFacts, type AgentState } from '../src/core/state.js'
+import { applyFacts, reduce, type AgentState } from '../src/core/state.js'
 import { isFactEvent, type AgentEvent, type FactEvent } from '../src/core/events.js'
 
 /**
@@ -21,12 +21,12 @@ function beginTurn(world: TestWorld, state: AgentState, prompt: string): AgentSt
     prompt,
     state.messages.length > 0 ? state.messages[state.messages.length - 1]!.id : null,
   )
+  state = reduce(state, { type: 'user.message.accepted', message: userMessage })
   return {
     ...state,
-    messages: [...state.messages, userMessage],
     iteration: 0,
     turnId: world.runtime.ids.next('turn'),
-    recovery: { ...state.recovery, stopHookRetries: 0, verifierRepairs: 0 },
+    recovery: { ...state.recovery, stopHookRetries: 0 },
     budget: {
       ...state.budget,
       used: { ...state.budget.used, startedAt: world.runtime.clock.now() },
@@ -40,6 +40,71 @@ function collectFacts(): { facts: FactEvent[]; observe: (event: AgentEvent) => v
 }
 
 describe('CLI cross-turn state sync (driveTurn)', () => {
+  test('a human follow-up durably reopens an unresolved verifier result', async () => {
+    const world = await makeWorld({ turns: [textTurn('follow-up acknowledged')] })
+    try {
+      const state = world.runtime.makeInitialState()
+      state.phase = 'terminated'
+      state.lastVerification = {
+        valid: true,
+        report: {
+          verdict: 'PARTIAL', summary: 'offline', checks: [], failures: [],
+          unverified: [{ item: 'service', reason: 'offline' }],
+        },
+      }
+      const prepared = beginTurn(world, state, 'continue fixing')
+      expect(prepared.lastTransition).toEqual({ reason: 'user_followup' })
+      expect(prepared.lastVerification).toBeUndefined()
+      expect(prepared.pendingVerificationRepair).toMatchObject({
+        attempt: 1,
+        report: { verdict: 'PARTIAL' },
+      })
+    } finally {
+      await world.cleanup()
+    }
+  })
+
+  test('a human follow-up invalidates a terminal PASS before new work', async () => {
+    const world = await makeWorld({ turns: [textTurn('follow-up acknowledged')] })
+    try {
+      const state = world.runtime.makeInitialState()
+      state.phase = 'terminated'
+      state.lastVerification = {
+        valid: true,
+        report: {
+          verdict: 'PASS', summary: 'previous request passed', checks: [],
+          failures: [], unverified: [],
+        },
+      }
+      const prepared = beginTurn(world, state, 'make another change')
+      expect(prepared.lastTransition).toEqual({ reason: 'user_followup' })
+      expect(prepared.lastVerification).toBeUndefined()
+      expect(prepared.pendingVerificationRepair).toBeUndefined()
+    } finally {
+      await world.cleanup()
+    }
+  })
+
+  test('a human prompt invalidates PASS after the verifier fact but before termination', async () => {
+    const world = await makeWorld({ turns: [textTurn('follow-up acknowledged')] })
+    try {
+      const state = world.runtime.makeInitialState()
+      state.phase = 'evaluating_completion'
+      state.lastVerification = {
+        valid: true,
+        report: {
+          verdict: 'PASS', summary: 'flushed before crash', checks: [],
+          failures: [], unverified: [],
+        },
+      }
+      const prepared = beginTurn(world, state, 'new request after restart')
+      expect(prepared.lastTransition).toEqual({ reason: 'user_followup' })
+      expect(prepared.lastVerification).toBeUndefined()
+    } finally {
+      await world.cleanup()
+    }
+  })
+
   test('plan, workspace and evidence facts survive into the next turn; budget accumulates', async () => {
     const world = await makeWorld({
       mode: 'bypassPermissions',
@@ -158,6 +223,7 @@ describe('CLI cross-turn state sync (driveTurn)', () => {
         toolCallTurn([{ id: 'r2', name: 'Read', input: { path: 'missing-2.txt' } }]),
         toolCallTurn([{ id: 'r3', name: 'Read', input: { path: 'missing-3.txt' } }]),
         textTurn('noted, will replan'),
+        textTurn('still awaiting approval'),
         // turn 2: write must still be locked, then the revised plan unlocks it
         toolCallTurn([
           { id: 'w1', name: 'Write', input: { path: 'locked.txt', content: 'no', overwrite: true } },
@@ -178,7 +244,7 @@ describe('CLI cross-turn state sync (driveTurn)', () => {
       let state = await stateWithUser(world, 'do the work')
       const t1 = await driveTurn(world.runtime.engine, state, new AbortController().signal)
       state = t1.state
-      expect(t1.terminal).toEqual({ reason: 'completed' })
+      expect(t1.terminal?.reason).toBe('completed_with_unverified_items')
 
       // the replan flags are part of durable cross-turn state
       expect(state.recovery.replanning).toBe(true)

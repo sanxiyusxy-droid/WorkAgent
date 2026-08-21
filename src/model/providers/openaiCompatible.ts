@@ -1,5 +1,5 @@
 import type { ConversationMessage } from '../../core/messages.js'
-import { renderText } from '../../tools/ToolOutputStore.js'
+import { renderModelToolResult } from '../../tools/ToolOutputStore.js'
 import type {
   ModelError,
   ModelGateway,
@@ -39,7 +39,10 @@ function encodeMessages(request: ModelRequest): OpenAIMessage[] {
           out.push({
             role: 'tool',
             tool_call_id: block.callId,
-            content: renderText(block.content),
+            content: renderModelToolResult({
+              content: block.content,
+              observation: block.observation,
+            }),
           })
         }
         continue

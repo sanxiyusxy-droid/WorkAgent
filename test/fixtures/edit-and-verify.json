@@ -24,6 +24,7 @@
     { "text": "Changed answer to 42 and verified with echo." }
   ],
   "expectedTrace": [
+    "plan.health.assessed",
     "assistant.message.completed",
     "tool.call.accepted:c1",
     "permission.decided:Read:allow",

@@ -47,6 +47,21 @@ async function decide(
 describe('shell analysis', () => {
   test.each([
     ['git status', 'readonly'],
+    ['git branch', 'readonly'],
+    ['git branch -a', 'readonly'],
+    ['git branch injected', 'write'],
+    ['git tag v1', 'write'],
+    ['git stash push', 'write'],
+    ['git remote -v', 'readonly'],
+    ['git remote add x https://example.com/repo', 'write'],
+    ['git diff --output=changed.txt', 'write'],
+    ['rg --pre node pattern .', 'dangerous'],
+    ['find . -fprint changed.txt', 'dangerous'],
+    ['date --set=2026-01-01', 'dangerous'],
+    ['date 010100002026', 'dangerous'],
+    ['date 01-01-26', 'dangerous'],
+    ['file -C -m ./magic', 'dangerous'],
+    ['file --compile --magic-file ./magic', 'dangerous'],
     ['ls -la', 'readonly'],
     ['npm test', 'write'],
     ['git push origin main', 'write'],
@@ -130,11 +145,18 @@ describe('permission matrix', () => {
     expect(decision.reason.type).toBe('hard_safety')
   })
 
-  test('ShellReadOnly denies write-class commands', async () => {
+  test.each([
+    'npm install',
+    'git branch injected',
+    'git tag v1',
+    'git stash push',
+    'git remote add x https://example.com/repo',
+    'git diff --output=changed.txt',
+  ])('ShellReadOnly denies write-class command: %s', async command => {
     const engine = makeEngine(null)
     const decision = await decide(
       engine, ShellReadOnlyTool,
-      { command: 'npm install', timeoutMs: 1000 },
+      { command, timeoutMs: 1000 },
       'plan',
     )
     expect(decision.behavior).toBe('deny')

@@ -18,6 +18,7 @@ agent.config.json
 
 # scratch directories created by tests/scripts
 tmp-*/
+test-out.txt
 
 # OS / editor noise
 .DS_Store

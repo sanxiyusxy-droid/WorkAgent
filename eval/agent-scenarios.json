@@ -1,0 +1,519 @@
+{
+  "schemaVersion": 1,
+  "defaults": {
+    "runs": 2
+  },
+  "scenarios": [
+    {
+      "id": "healthy-read",
+      "title": "Healthy read completes with paired tool facts",
+      "category": "correctness",
+      "driver": "agent",
+      "prompt": "Read input.txt and report completion.",
+      "mode": "bypassPermissions",
+      "files": {
+        "input.txt": "alpha\n"
+      },
+      "turns": [
+        {
+          "kind": "tools",
+          "calls": [
+            { "id": "read_1", "name": "Read", "input": { "path": "input.txt" } }
+          ]
+        },
+        { "kind": "text", "text": "Read completed." }
+      ],
+      "expect": {
+        "terminal": ["completed"],
+        "maxModelRequests": 2,
+        "maxToolCalls": 1,
+        "toolResults": { "read_1": "ok" },
+        "requiredFacts": ["assistant.message.completed", "tool.call.completed"]
+      }
+    },
+    {
+      "id": "retryable-model-fault",
+      "title": "A retryable model fault is recovered exactly once",
+      "category": "model-recovery",
+      "driver": "agent",
+      "fault": "one RATE_LIMIT response before the scripted answer",
+      "prompt": "Finish without using a tool.",
+      "mode": "bypassPermissions",
+      "turns": [
+        { "kind": "text", "text": "Recovered and completed." }
+      ],
+      "modelFaults": [
+        {
+          "point": "model_request",
+          "occurrence": 1,
+          "error": { "code": "RATE_LIMIT", "retryAfterMs": 0, "retryable": true }
+        }
+      ],
+      "expect": {
+        "terminal": ["completed"],
+        "modelRequests": 2,
+        "maxToolCalls": 0,
+        "modelFailureCodes": { "RATE_LIMIT": 1 },
+        "requiredFacts": ["model.attempt.failed"]
+      }
+    },
+    {
+      "id": "unknown-tool",
+      "title": "Unknown tools fail as bounded tool results",
+      "category": "tool-contract",
+      "driver": "agent",
+      "fault": "model requests an unregistered tool",
+      "prompt": "Try the requested operation and handle a tool error.",
+      "mode": "bypassPermissions",
+      "turns": [
+        {
+          "kind": "tools",
+          "calls": [
+            { "id": "unknown_1", "name": "DefinitelyMissingTool", "input": {} }
+          ]
+        },
+        { "kind": "text", "text": "The unavailable tool was handled." }
+      ],
+      "expect": {
+        "terminal": ["completed"],
+        "maxModelRequests": 2,
+        "maxToolCalls": 1,
+        "toolErrors": { "unknown_1": "UNKNOWN_TOOL" }
+      }
+    },
+    {
+      "id": "version-conflict-replan",
+      "title": "Three optimistic-concurrency conflicts trigger a local replan",
+      "category": "planning",
+      "driver": "agent",
+      "fault": "three stale file versions",
+      "prompt": "Update a.txt while respecting optimistic concurrency.",
+      "mode": "bypassPermissions",
+      "files": {
+        "a.txt": "alpha\n"
+      },
+      "turns": [
+        {
+          "kind": "tools",
+          "calls": [
+            { "id": "read_1", "name": "Read", "input": { "path": "a.txt" } },
+            {
+              "id": "edit_1",
+              "name": "Edit",
+              "input": {
+                "path": "a.txt",
+                "oldText": "alpha",
+                "newText": "beta-1",
+                "expectedVersion": "stale-1"
+              }
+            }
+          ]
+        },
+        {
+          "kind": "tools",
+          "calls": [
+            { "id": "read_2", "name": "Read", "input": { "path": "a.txt" } },
+            {
+              "id": "edit_2",
+              "name": "Edit",
+              "input": {
+                "path": "a.txt",
+                "oldText": "alpha",
+                "newText": "beta-2",
+                "expectedVersion": "stale-2"
+              }
+            }
+          ]
+        },
+        {
+          "kind": "tools",
+          "calls": [
+            { "id": "read_3", "name": "Read", "input": { "path": "a.txt" } },
+            {
+              "id": "edit_3",
+              "name": "Edit",
+              "input": {
+                "path": "a.txt",
+                "oldText": "alpha",
+                "newText": "beta-3",
+                "expectedVersion": "stale-3"
+              }
+            }
+          ]
+        },
+        { "kind": "text", "text": "The edit sequence was revised." }
+      ],
+      "runtime": {
+        "replan": { "failureThreshold": 99, "conflictThreshold": 3 }
+      },
+      "expect": {
+        "terminal": ["completed"],
+        "maxModelRequests": 4,
+        "maxToolCalls": 6,
+        "toolErrors": {
+          "edit_1": "FILE_VERSION_CONFLICT",
+          "edit_2": "FILE_VERSION_CONFLICT",
+          "edit_3": "FILE_VERSION_CONFLICT"
+        },
+        "replan": {
+          "cause": "version_conflict_threshold",
+          "requiresReapproval": false,
+          "count": 1
+        },
+        "requiredFacts": ["replan.adjustment.applied"],
+        "absentFacts": ["plan.status.changed"],
+        "filesEqual": { "a.txt": "alpha\n" }
+      }
+    },
+    {
+      "id": "repeated-call-reflection",
+      "title": "Repeated identical calls produce a stagnation reflection",
+      "category": "reflection",
+      "driver": "agent",
+      "fault": "three identical reads without progress",
+      "prompt": "Inspect a.txt without repeating ineffective work.",
+      "mode": "bypassPermissions",
+      "files": {
+        "a.txt": "alpha\n"
+      },
+      "turns": [
+        {
+          "kind": "tools",
+          "calls": [{ "id": "read_1", "name": "Read", "input": { "path": "a.txt" } }]
+        },
+        {
+          "kind": "tools",
+          "calls": [{ "id": "read_2", "name": "Read", "input": { "path": "a.txt" } }]
+        },
+        {
+          "kind": "tools",
+          "calls": [{ "id": "read_3", "name": "Read", "input": { "path": "a.txt" } }]
+        },
+        { "kind": "text", "text": "Stopped repeating the same read." }
+      ],
+      "runtime": {
+        "intelligence": { "enabled": true, "reflectionInterval": 99 }
+      },
+      "expect": {
+        "terminal": ["completed"],
+        "maxModelRequests": 4,
+        "maxToolCalls": 3,
+        "stagnation": { "kind": "repeated_call", "count": 1 },
+        "reflection": { "trigger": "stagnation", "count": 1 }
+      }
+    },
+    {
+      "id": "high-impact-scope-lock",
+      "title": "High-impact scope drift supersedes the plan and locks writes",
+      "category": "safety-policy",
+      "driver": "agent",
+      "fault": "two unplanned writes exceed an approved one-file scope",
+      "prompt": "Execute only the approved scoped work.",
+      "mode": "bypassPermissions",
+      "turns": [
+        {
+          "kind": "tools",
+          "calls": [
+            {
+              "id": "plan_1_call",
+              "name": "PlanPropose",
+              "input": {
+                "goal": "scoped work",
+                "steps": [
+                  { "id": "step_1", "title": "Edit planned file", "files": ["planned.txt"] }
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "kind": "tools",
+          "calls": [
+            {
+              "id": "approve_1",
+              "name": "ExitPlanMode",
+              "input": { "planId": "plan_1", "version": 1 }
+            }
+          ]
+        },
+        {
+          "kind": "tools",
+          "calls": [
+            { "id": "write_1", "name": "Write", "input": { "path": "unplanned-1.txt", "content": "x" } },
+            { "id": "write_2", "name": "Write", "input": { "path": "unplanned-2.txt", "content": "y" } }
+          ]
+        },
+        {
+          "kind": "tools",
+          "calls": [
+            { "id": "write_locked", "name": "Write", "input": { "path": "unplanned-3.txt", "content": "z" } }
+          ]
+        },
+        { "kind": "text", "text": "A revised plan is required." },
+        { "kind": "text", "text": "Completion remains blocked until reapproval." }
+      ],
+      "runtime": {
+        "replan": { "scopeRatio": 2 }
+      },
+      "expect": {
+        "terminal": ["completed_with_unverified_items"],
+        "maxModelRequests": 6,
+        "maxToolCalls": 5,
+        "toolResults": { "write_1": "ok", "write_2": "ok" },
+        "toolErrors": { "write_locked": "REPLAN_APPROVAL_PENDING" },
+        "replan": { "cause": "scope_exceeded", "requiresReapproval": true, "count": 1 },
+        "requiredFacts": ["plan.status.changed"],
+        "filesEqual": {
+          "unplanned-1.txt": "x",
+          "unplanned-2.txt": "y"
+        },
+        "absentFiles": ["unplanned-3.txt"],
+        "requestTools": [
+          {
+            "request": 4,
+            "include": ["PlanPropose", "ExitPlanMode"],
+            "exclude": ["Write", "Edit", "Shell"]
+          }
+        ]
+      }
+    },
+    {
+      "id": "supervisor-action-lane",
+      "title": "A repair-plan decision narrows model tools and rejects a stale forged write",
+      "category": "planning-policy",
+      "driver": "agent",
+      "fault": "model emits a workspace write from a stale schema after the supervisor switches to repair_plan",
+      "prompt": "Create one task, make its failure explicit, and obey the resulting supervisor lane.",
+      "mode": "bypassPermissions",
+      "files": { "guarded.txt": "unchanged" },
+      "turns": [
+        {
+          "kind": "tools",
+          "calls": [
+            {
+              "id": "task_create",
+              "name": "TaskCreate",
+              "input": { "subject": "guarded task", "activeForm": "working" }
+            }
+          ]
+        },
+        {
+          "kind": "tools",
+          "calls": [
+            {
+              "id": "task_fail",
+              "name": "TaskUpdate",
+              "input": { "id": "task_1", "expectedRevision": 1, "status": "failed" }
+            }
+          ]
+        },
+        {
+          "kind": "tools",
+          "calls": [
+            {
+              "id": "forged_write",
+              "name": "Write",
+              "input": { "path": "guarded.txt", "content": "changed", "overwrite": true }
+            }
+          ]
+        },
+        {
+          "kind": "tools",
+          "calls": [
+            {
+              "id": "task_reset",
+              "name": "TaskUpdate",
+              "input": { "id": "task_1", "expectedRevision": 2, "status": "pending" }
+            }
+          ]
+        },
+        {
+          "kind": "tools",
+          "calls": [
+            {
+              "id": "task_start",
+              "name": "TaskUpdate",
+              "input": { "id": "task_1", "expectedRevision": 3, "status": "in_progress" }
+            }
+          ]
+        },
+        {
+          "kind": "tools",
+          "calls": [
+            {
+              "id": "task_complete",
+              "name": "TaskUpdate",
+              "input": { "id": "task_1", "expectedRevision": 4, "status": "completed" }
+            }
+          ]
+        },
+        { "kind": "text", "text": "The stale write was rejected; the plan must be repaired first." }
+      ],
+      "runtime": { "intelligence": { "enabled": true, "reflectionInterval": 99 } },
+      "expect": {
+        "terminal": ["completed"],
+        "maxModelRequests": 7,
+        "maxToolCalls": 6,
+        "toolErrors": { "forged_write": "TOOL_NOT_AVAILABLE_FOR_ACTION" },
+        "filesEqual": { "guarded.txt": "unchanged" },
+        "requiredFacts": ["tool.lane.selected"],
+        "requestTools": [
+          { "request": 2, "include": ["Write"] },
+          { "request": 3, "exclude": ["Write"] }
+        ],
+        "lane": {
+          "action": "repair_plan",
+          "request": 3,
+          "include": ["PlanRepair", "PlanPropose", "Read"],
+          "exclude": ["Write", "Edit", "Shell"],
+          "refusedCallId": "forged_write"
+        }
+      }
+    },
+    {
+      "id": "recovery-orphan",
+      "title": "Recovery repairs orphaned calls and missing result messages",
+      "category": "recovery",
+      "driver": "recovery_orphan",
+      "fault": "process stops after acceptance or after completion persistence",
+      "expect": {
+        "terminal": ["completed"],
+        "maxModelRequests": 1,
+        "maxToolCalls": 2,
+        "requiredFacts": ["tool.result.message"]
+      }
+    },
+    {
+      "id": "recovery-checksum",
+      "title": "Checksum corruption stops at the last trusted envelope",
+      "category": "recovery",
+      "driver": "recovery_checksum",
+      "fault": "journal checksum mismatch",
+      "expect": {
+        "terminal": ["recovery_refused"],
+        "diagnostic": "checksum_mismatch",
+        "lastTrustedSeq": 1,
+        "maxModelRequests": 0,
+        "maxToolCalls": 0
+      }
+    },
+    {
+      "id": "recovery-snapshot",
+      "title": "V4 snapshot plus tail is equivalent to full replay",
+      "category": "recovery",
+      "driver": "recovery_snapshot",
+      "prompt": "Read and write enough state to create a V4 snapshot.",
+      "files": { "a.txt": "alpha" },
+      "turns": [
+        {
+          "kind": "tools",
+          "calls": [{ "id": "read_1", "name": "Read", "input": { "path": "a.txt" } }]
+        },
+        {
+          "kind": "tools",
+          "calls": [
+            { "id": "write_1", "name": "Write", "input": { "path": "b.txt", "content": "beta", "overwrite": true } }
+          ]
+        },
+        {
+          "kind": "tools",
+          "calls": [{ "id": "read_2", "name": "Read", "input": { "path": "b.txt" } }]
+        },
+        {
+          "kind": "tools",
+          "calls": [{ "id": "read_3", "name": "Read", "input": { "path": "a.txt" } }]
+        },
+        { "kind": "text", "text": "Snapshot source run completed." }
+      ],
+      "expect": {
+        "terminal": ["completed"],
+        "maxModelRequests": 5,
+        "maxToolCalls": 4,
+        "requiredFacts": ["state.snapshot"]
+      }
+    },
+    {
+      "id": "recovery-degraded-branch",
+      "title": "Degraded recovery forks a read-only branch and preserves the source",
+      "category": "recovery",
+      "driver": "recovery_degraded_branch",
+      "fault": "valid journal fact violates a reducer invariant",
+      "turns": [
+        {
+          "kind": "tools",
+          "calls": [
+            { "id": "branch_write", "name": "Write", "input": { "path": "blocked.txt", "content": "no" } }
+          ]
+        },
+        { "kind": "text", "text": "The recovery branch remained read-only." }
+      ],
+      "expect": {
+        "terminal": ["completed"],
+        "diagnostic": "replan_adjustment_without_request",
+        "lastTrustedSeq": 2,
+        "maxModelRequests": 2,
+        "maxToolCalls": 1,
+        "toolErrors": { "branch_write": "TOOL_NOT_AVAILABLE_IN_MODE" },
+        "requiredFacts": ["session.recovery.branch"],
+        "absentFiles": ["blocked.txt"],
+        "requestTools": [
+          { "request": 1, "include": ["PlanPropose"], "exclude": ["Write", "Edit", "Shell"] }
+        ]
+      }
+    },
+    {
+      "id": "calibration-history-pin",
+      "title": "History calibration stays pinned across mutation and V4 recovery",
+      "category": "adaptive-recovery",
+      "driver": "calibration_resume",
+      "calibrationCase": "history_pin",
+      "fault": "the source history is replaced with the opposite outcome before resume",
+      "expect": {
+        "terminal": ["completed", "completed_with_unverified_items"],
+        "maxModelRequests": 10,
+        "maxToolCalls": 6,
+        "requiredFacts": [
+          "outcome.calibration.selected",
+          "reflection.recorded",
+          "state.snapshot"
+        ]
+      }
+    },
+    {
+      "id": "calibration-empty-pin",
+      "title": "An empty calibration decision remains pinned when history appears later",
+      "category": "adaptive-recovery",
+      "driver": "calibration_resume",
+      "calibrationCase": "empty_pin",
+      "fault": "eligible positive history appears only after the current session boot",
+      "expect": {
+        "terminal": ["completed", "completed_with_unverified_items"],
+        "maxModelRequests": 10,
+        "maxToolCalls": 6,
+        "requiredFacts": [
+          "outcome.calibration.selected",
+          "reflection.recorded",
+          "state.snapshot"
+        ]
+      }
+    },
+    {
+      "id": "calibration-disabled-precedence",
+      "title": "Runtime disable suppresses but never replaces a durable calibration pin",
+      "category": "adaptive-policy",
+      "driver": "calibration_resume",
+      "calibrationCase": "disabled_precedence",
+      "fault": "a positive pinned profile is resumed with calibration explicitly disabled",
+      "expect": {
+        "terminal": ["completed", "completed_with_unverified_items"],
+        "maxModelRequests": 10,
+        "maxToolCalls": 6,
+        "requiredFacts": [
+          "outcome.calibration.selected",
+          "reflection.recorded",
+          "state.snapshot"
+        ]
+      }
+    }
+  ]
+}

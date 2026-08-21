@@ -1,4 +1,6 @@
 import type { AgentMode } from '../core/events.js'
+import type { ToolExecutionLane } from '../planning/ToolExecutionLane.js'
+import { isToolAllowedByLane } from '../planning/ToolExecutionLane.js'
 import type { ToolDefinition } from './Tool.js'
 
 /** Tools visible to the model while in plan mode. Capability projection is
@@ -7,6 +9,14 @@ const PLAN_ALLOWED_TOOLS = new Set([
   'Read',
   'Glob',
   'Grep',
+  'CodeSymbols',
+  'FindReferences',
+  'CallGraph',
+  'CodeDiagnostics',
+  'SearchCodeIndex',
+  'ExpandCodeContext',
+  'RefreshCodeIndex',
+  'CodeIndexStatus',
   'ShellReadOnly',
   'AskUser',
   'PlanPropose',
@@ -37,11 +47,12 @@ export class ToolRegistry {
    * model-facing schema, not just the runtime. */
   availableFor(
     mode: AgentMode,
-    opts?: { writeLocked?: boolean },
+    opts?: { writeLocked?: boolean; lane?: Readonly<ToolExecutionLane> },
   ): ToolDefinition<any, any>[] {
     const restricted = mode === 'plan' || opts?.writeLocked === true
     return [...this.tools.values()]
       .filter(t => (restricted ? PLAN_ALLOWED_TOOLS.has(t.name) : true))
+      .filter(t => isToolAllowedByLane(opts?.lane, t.name))
       .sort((a, b) => a.name.localeCompare(b.name))
   }
 
@@ -50,9 +61,15 @@ export class ToolRegistry {
    * mode-agnostic on purpose (the runtime needs the definition to explain the
    * refusal), so callers must consult this before executing.
    */
-  isAvailableIn(name: string, mode: AgentMode): boolean {
+  isAvailableIn(
+    name: string,
+    mode: AgentMode,
+    opts?: { writeLocked?: boolean; lane?: Readonly<ToolExecutionLane> },
+  ): boolean {
     if (!this.tools.has(name)) return false
-    return mode === 'plan' ? PLAN_ALLOWED_TOOLS.has(name) : true
+    const restricted = mode === 'plan' || opts?.writeLocked === true
+    if (restricted && !PLAN_ALLOWED_TOOLS.has(name)) return false
+    return isToolAllowedByLane(opts?.lane, name)
   }
 
   names(): string[] {

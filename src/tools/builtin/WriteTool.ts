@@ -126,6 +126,33 @@ export const WriteTool = defineTool<z.infer<typeof WriteInput>, WriteOutput>({
     }
   },
 
+  postconditions: async (_input, output, ctx) => {
+    const check = await checkPathReal(output.path, ctx.workspaceRoot)
+    if (!check.ok) {
+      return [{ id: 'new-version-committed', passed: false, detail: check.reason }]
+    }
+    try {
+      const current = await readFileVersion(check.resolved)
+      return [{
+        id: 'new-version-committed',
+        passed: current.version === output.newVersion,
+        detail: current.version,
+      }]
+    } catch {
+      return [{ id: 'new-version-committed', passed: false, detail: 'file disappeared' }]
+    }
+  },
+
+  observe: async (_input, output) => ({
+    summary: `${output.created ? 'Created' : 'Overwrote'} ${output.path}`,
+    fields: {
+      path: output.path,
+      created: output.created,
+      bytes: output.bytes,
+      newVersion: output.newVersion,
+    },
+  }),
+
   serialize: output => ({
     kind: 'text',
     text:

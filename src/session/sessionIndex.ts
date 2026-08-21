@@ -117,7 +117,7 @@ export async function latestResumableSession(
 /**
  * Delete a session directory that this run created but never used, so empty
  * runs do not pile up. Guarded: only removes a directory that contains nothing
- * but a journal made exclusively of `run.started` facts.
+ * but bootstrap facts (`run.started` and an optional calibration selection).
  */
 export async function removeSessionIfUnused(
   workspaceRoot: string,
@@ -135,10 +135,12 @@ export async function removeSessionIfUnused(
   const loaded = await loadSession(join(dir, 'journal.jsonl'))
   if (!loaded.ok) return false // never touch a journal we could not fully read
   if (loaded.envelopes.length === 0) return false
-  const onlyRunStarted = loaded.envelopes.every(
-    envelope => envelope.event.type === 'run.started',
+  const onlyBootstrapFacts = loaded.envelopes.every(
+    envelope =>
+      envelope.event.type === 'run.started' ||
+      envelope.event.type === 'outcome.calibration.selected',
   )
-  if (!onlyRunStarted) return false
+  if (!onlyBootstrapFacts) return false
 
   await rm(dir, { recursive: true, force: true })
   return true

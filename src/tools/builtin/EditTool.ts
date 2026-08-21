@@ -157,6 +157,33 @@ export const EditTool = defineTool<z.infer<typeof EditInput>, EditOutput>({
     }
   },
 
+  postconditions: async (_input, output, ctx) => {
+    const check = await checkPathReal(output.path, ctx.workspaceRoot)
+    if (!check.ok) {
+      return [{ id: 'new-version-committed', passed: false, detail: check.reason }]
+    }
+    try {
+      const current = await readFileVersion(check.resolved)
+      return [{
+        id: 'new-version-committed',
+        passed: current.version === output.newVersion,
+        detail: current.version,
+      }]
+    } catch {
+      return [{ id: 'new-version-committed', passed: false, detail: 'file disappeared' }]
+    }
+  },
+
+  observe: async (_input, output) => ({
+    summary: `Edited ${output.path} with ${output.replacements} replacement(s)`,
+    fields: {
+      path: output.path,
+      oldVersion: output.oldVersion,
+      newVersion: output.newVersion,
+      replacements: output.replacements,
+    },
+  }),
+
   serialize: output => ({
     kind: 'text',
     text:

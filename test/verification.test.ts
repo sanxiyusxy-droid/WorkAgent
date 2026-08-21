@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'vitest'
 import { createHash } from 'node:crypto'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { textTurn, toolCallTurn } from '../src/model/ScriptedModel.js'
@@ -10,6 +10,7 @@ import { validateReport } from '../src/verification/verdict.js'
 import { findStaleReceipts } from '../src/verification/VerifierRunner.js'
 import { readFileVersion, computeVersion } from '../src/workspace/FileVersion.js'
 import { createSequentialIds } from '../src/core/runtimePrimitives.js'
+import { createInitialState, reduce } from '../src/core/state.js'
 import type { VerificationReport, EvidenceReceipt } from '../src/verification/types.js'
 
 function makeReceipt(id: string, overrides?: Partial<EvidenceReceipt>): EvidenceReceipt {
@@ -92,6 +93,30 @@ describe('validateReport', () => {
     expect(validateReport(report, store)).toMatchObject({
       ok: false,
       reason: expect.stringContaining('failed or skipped'),
+    })
+  })
+
+  test.each([
+    {
+      field: 'failures',
+      overrides: {
+        failures: [{
+          title: 'real failure', severity: 'high' as const,
+          reproduction: ['run the failing case'], evidenceIds: [],
+        }],
+      },
+    },
+    {
+      field: 'unverified',
+      overrides: {
+        unverified: [{ item: 'external service', reason: 'offline' }],
+      },
+    },
+  ])('PASS containing $field is rejected', ({ overrides }) => {
+    const store = makeEvidenceStore(['ev_a'])
+    expect(validateReport(passReport(overrides), store)).toMatchObject({
+      ok: false,
+      reason: expect.stringContaining('cannot contain'),
     })
   })
 
@@ -392,6 +417,22 @@ describe('verification E2E', () => {
     unverified: [],
   })
 
+  test('reducer rejects an invalid PASS fact instead of failing open', () => {
+    const state = createInitialState({
+      sessionId: 's', runId: 'r', turnId: 't', workspaceRoot: 'workspace',
+      now: 0,
+      budget: { maxTurns: 1, maxModelCalls: 1, maxToolCalls: 1, maxWallTimeMs: 1 },
+    })
+    expect(() => reduce(state, {
+      type: 'verification.completed',
+      valid: false,
+      report: {
+        verdict: 'PASS', summary: 'invalid', checks: [], failures: [],
+        unverified: [],
+      },
+    })).toThrow(/invalid verifier report cannot be persisted as PASS/i)
+  })
+
   test('verifier FAIL repairs once, then escalates to the replan protocol', async () => {
     const world = await makeWorld({
       mode: 'acceptEdits',
@@ -462,6 +503,150 @@ describe('verification E2E', () => {
       }
 
       expect(result.terminal.reason).toBe('completed_with_unverified_items')
+    } finally {
+      await world.cleanup()
+    }
+  })
+
+  test('approved-plan verifier repair reopens writes and preserves the FAIL across replay state', async () => {
+    const partialReport = JSON.stringify({
+      verdict: 'PARTIAL',
+      summary: 'environment-limited follow-up',
+      checks: [],
+      failures: [],
+      unverified: [
+        { item: 'external integration', reason: 'not available in this harness' },
+      ],
+    })
+    const world = await makeWorld({
+      mode: 'acceptEdits',
+      verification: { enabled: true, riskThreshold: 1, maxRepairAttempts: 1 },
+      channels: { requestPlanApproval: async () => true },
+      turns: [
+        toolCallTurn([{ id: 'enter_plan', name: 'EnterPlanMode', input: {} }]),
+        toolCallTurn([{
+          id: 'propose_plan',
+          name: 'PlanPropose',
+          input: {
+            goal: 'write and verify out.txt',
+            steps: [{
+              id: 'step_1',
+              title: 'write output',
+              description: 'create the approved output',
+              files: ['out.txt'],
+              dependsOn: [],
+              expectedOutcome: 'out.txt is verified',
+            }],
+          },
+        }]),
+        toolCallTurn([{
+          id: 'approve_plan',
+          name: 'ExitPlanMode',
+          input: { planId: 'plan_1', version: 1 },
+        }]),
+        toolCallTurn([{
+          id: 'create_task',
+          name: 'TaskCreate',
+          input: { subject: 'write output', stepId: 'step_1' },
+        }]),
+        toolCallTurn([{
+          id: 'start_task',
+          name: 'TaskUpdate',
+          input: { id: 'task_1', expectedRevision: 1, status: 'in_progress' },
+        }]),
+        toolCallTurn([{
+          id: 'initial_write',
+          name: 'Write',
+          input: { path: 'out.txt', content: 'v1' },
+        }]),
+        toolCallTurn([{
+          id: 'complete_task',
+          name: 'TaskUpdate',
+          input: { id: 'task_1', expectedRevision: 2, status: 'completed' },
+        }]),
+        textTurn('ready for independent verification'),
+        textTurn(failReportJson),
+        toolCallTurn([{
+          id: 'repair_write',
+          name: 'Write',
+          input: { path: 'out.txt', content: 'v2', overwrite: true },
+        }]),
+        textTurn('repair complete; verify again'),
+        textTurn(partialReport),
+      ],
+    })
+    try {
+      const result = await collectRun(
+        world.runtime.engine,
+        await stateWithUser(world, 'write and verify out.txt'),
+      )
+      expect(result.facts.some(fact => fact.type === 'plan.approved')).toBe(true)
+      expect(world.runtime.tasks.get('task_1')?.status).toBe('completed')
+
+      const failIndex = result.facts.findIndex(
+        fact =>
+          fact.type === 'verification.completed' &&
+          fact.report.verdict === 'FAIL',
+      )
+      expect(failIndex).toBeGreaterThanOrEqual(0)
+      const failFact = result.facts[failIndex]
+      expect(failFact).toMatchObject({
+        type: 'verification.completed',
+        repairAttempt: 1,
+      })
+      const repairLane = result.facts.slice(failIndex + 1).find(
+        fact => fact.type === 'tool.lane.selected',
+      )
+      expect(repairLane).toMatchObject({
+        selection: { action: 'continue_step', lane: 'open' },
+      })
+
+      const verifierRequestIndex = world.model.requests.findIndex(request =>
+        request.system.includes('adversarial verification agent'),
+      )
+      expect(verifierRequestIndex).toBeGreaterThanOrEqual(0)
+      const repairRequest = world.model.requests
+        .slice(verifierRequestIndex + 1)
+        .find(request => !request.system.includes('adversarial verification agent'))
+      expect(repairRequest?.system).toContain('edge case broken')
+      expect(repairRequest?.tools.map(tool => tool.name)).toEqual(
+        expect.arrayContaining(['Write', 'Edit', 'ApplyPatch']),
+      )
+      expect(result.facts.find(
+        fact =>
+          fact.type === 'tool.call.completed' &&
+          fact.result.callId === 'repair_write',
+      )).toMatchObject({ result: { ok: true } })
+      await expect(readFile(join(world.workspaceRoot, 'out.txt'), 'utf8')).resolves.toBe('v2')
+      expect(result.terminal.reason).toBe('completed_with_unverified_items')
+    } finally {
+      await world.cleanup()
+    }
+  })
+
+  test('a replayed non-PASS verification can never fall through to completed', async () => {
+    const world = await makeWorld({
+      verification: { enabled: true, riskThreshold: 1, maxRepairAttempts: 0 },
+      turns: [textTurn('resume after the verifier result')],
+    })
+    try {
+      let state = await stateWithUser(world, 'resume')
+      state = reduce(state, {
+        type: 'verification.completed',
+        valid: true,
+        report: {
+          verdict: 'PARTIAL',
+          summary: 'environment limited',
+          checks: [],
+          failures: [],
+          unverified: [{ item: 'external service', reason: 'offline' }],
+        },
+      })
+      const result = await collectRun(world.runtime.engine, state)
+      expect(result.terminal).toEqual({
+        reason: 'completed_with_unverified_items',
+        items: ['external service: offline'],
+      })
     } finally {
       await world.cleanup()
     }

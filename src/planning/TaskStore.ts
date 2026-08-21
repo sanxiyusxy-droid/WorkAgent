@@ -46,6 +46,7 @@ export class TaskStore {
     acceptanceCriteria?: string[]
     planId?: string
     planVersion?: number
+    stepId?: string
   }): TaskStoreResult<PlanTask> {
     const dependsOn = input.dependsOn ?? []
     for (const dep of dependsOn) {
@@ -57,6 +58,7 @@ export class TaskStore {
       id: this.deps.ids.next('task'),
       planId: input.planId,
       planVersion: input.planVersion,
+      stepId: input.stepId,
       subject: input.subject,
       description: input.description ?? '',
       activeForm: input.activeForm ?? input.subject,
@@ -180,6 +182,36 @@ export class TaskStore {
   /** Restore a task snapshot during journal replay (no invariant re-checks). */
   restore(task: PlanTask): void {
     this.tasks.set(task.id, task)
+  }
+
+  /**
+   * Carry unaffected tasks to a bounded local-repair version. The repaired
+   * step is reopened and loses old evidence; every change increments the
+   * optimistic revision and is returned for fact persistence.
+   */
+  migratePlanVersion(input: {
+    planId: string
+    fromVersion: number
+    toVersion: number
+    repairedStepId: string
+  }): PlanTask[] {
+    const changed: PlanTask[] = []
+    for (const task of this.tasks.values()) {
+      if (task.planId !== input.planId || task.planVersion !== input.fromVersion) continue
+      const repaired = task.stepId === input.repairedStepId
+      const next: PlanTask = {
+        ...task,
+        planVersion: input.toVersion,
+        status: repaired && task.status !== 'pending' ? 'pending' : task.status,
+        evidenceIds: repaired ? [] : task.evidenceIds,
+        blockedReason: repaired ? undefined : task.blockedReason,
+        revision: task.revision + 1,
+        updatedAt: this.deps.clock.isoNow(),
+      }
+      this.tasks.set(task.id, next)
+      changed.push(next)
+    }
+    return changed
   }
 
   private wouldCycle(taskId: string, newDeps: string[]): boolean {

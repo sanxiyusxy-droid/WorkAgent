@@ -36,7 +36,7 @@ function normalize(state: AgentState): Record<string, unknown> {
   }
 }
 
-describe('StateSnapshotV2 recovery equivalence', () => {
+describe('StateSnapshotV4 recovery equivalence', () => {
   test('snapshot+tail recovery is field-for-field equal to full replay', async () => {
     const world1 = await makeWorld({
       persist: true,
@@ -64,12 +64,12 @@ describe('StateSnapshotV2 recovery equivalence', () => {
 
       const loaded = await loadSession(world1.runtime.journalPath)
       expect(loaded.ok).toBe(true)
-      // the run is long enough to have produced a V2 snapshot
-      expect(loaded.lastSnapshot?.version).toBe(2)
+      // the run is long enough to have produced a V4 snapshot
+      expect(loaded.lastSnapshot?.version).toBe(4)
       expect(loaded.tailEvents.length).toBeGreaterThan(0)
       expect(loaded.tailEvents.length).toBeLessThan(loaded.envelopes.length)
 
-      // Path A: V2 snapshot + tail replay
+      // Path A: V4 snapshot + tail replay
       const worldA = await makeWorld({
         persist: true,
         sessionId: 'eq-session',
@@ -97,8 +97,32 @@ describe('StateSnapshotV2 recovery equivalence', () => {
       )
       expect(failB).toBeNull()
 
+      // Path C: a legacy V3 checkpoint is deliberately ignored; full replay
+      // must still recover the earlier calibration selection and policy state.
+      const worldC = await makeWorld({
+        persist: true,
+        sessionId: 'eq-session',
+        workspaceRoot: world1.workspaceRoot,
+        mode: 'bypassPermissions',
+        turns: [],
+      })
+      const legacyV3 = {
+        ...loaded.lastSnapshot!,
+        version: 3 as const,
+        outcomeCalibrationSelection: undefined,
+      }
+      const { state: stateC, replayFailure: failC } = await resumeState(
+        worldC.runtime,
+        { ...loaded, lastSnapshot: legacyV3 },
+      )
+      expect(failC).toBeNull()
+
       // field-for-field equivalence (minus runId/turnId/clock fields)
       expect(normalize(stateA)).toEqual(normalize(stateB))
+      expect(normalize(stateC)).toEqual(normalize(stateB))
+      expect(stateC.outcomeCalibrationSelection).toEqual(
+        stateB.outcomeCalibrationSelection,
+      )
 
       // spot-check the restored entities
       expect(stateA.messages.map(m => m.id)).toEqual(stateB.messages.map(m => m.id))

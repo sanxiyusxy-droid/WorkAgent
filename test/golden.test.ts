@@ -121,6 +121,16 @@ describe('golden transcript replay', () => {
 
         // 1. exact fact-event trace
         expect(traceOf(result.facts), `${name}: trace`).toEqual(fixture.expectedTrace)
+        const healthFacts = result.facts.filter(
+          (fact): fact is Extract<FactEvent, { type: 'plan.health.assessed' }> =>
+            fact.type === 'plan.health.assessed',
+        )
+        expect(healthFacts.length, `${name}: plan supervision facts`).toBeGreaterThan(0)
+        for (const fact of healthFacts) {
+          expect(fact.assessment.id, `${name}: durable health id`).not.toBe('pending')
+          expect(fact.assessment.signature).toMatch(/^[a-f0-9]{16}$/)
+          expect(fact.assessment.decision.successSignals.length).toBeGreaterThan(0)
+        }
 
         // 2. no unexpected extra model calls
         expect(world.model.requests, `${name}: model requests`).toHaveLength(

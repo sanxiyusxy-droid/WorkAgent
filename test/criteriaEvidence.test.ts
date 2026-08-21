@@ -30,6 +30,93 @@ function sign(receipt: EvidenceReceipt): EvidenceReceipt {
 }
 
 describe('shared criterion evidence policy', () => {
+  test('superseded-plan tasks do not block the current plan completion gate', () => {
+    const state = createInitialState({
+      sessionId: 's', runId: 'r', turnId: 't', workspaceRoot: 'workspace',
+      now: 0, mode: 'default',
+      budget: {
+        maxModelCalls: 10, maxToolCalls: 10, maxWallTimeMs: 10_000, maxTurns: 10,
+      },
+    })
+    state.tasks = [
+      {
+        id: 'old_task', planId: 'p', planVersion: 1, stepId: 'old_step',
+        subject: 'retired work', description: '', activeForm: 'retired',
+        status: 'blocked', blockedReason: 'superseded', dependsOn: [],
+        acceptanceCriteria: [], evidenceIds: [], revision: 1,
+        createdAt: 't', updatedAt: 't',
+      },
+      {
+        id: 'new_task', planId: 'p', planVersion: 2, stepId: 'new_step',
+        subject: 'current work', description: '', activeForm: 'done',
+        status: 'completed', dependsOn: [], acceptanceCriteria: [], evidenceIds: [],
+        revision: 1, createdAt: 't', updatedAt: 't',
+      },
+    ]
+    const result = evaluateCompletion({
+      state,
+      approvedPlan: {
+        planId: 'p', version: 2, status: 'approved', goal: 'new goal',
+        nonGoals: [], assumptions: [], decisions: [], steps: [],
+        acceptanceCriteria: [], risks: [], createdAt: 't',
+      },
+      evidence: [],
+      riskThreshold: 5,
+    })
+    expect(result.action).toBe('complete')
+    expect(result.missing).toEqual([])
+  })
+
+  test('a failed task in the current plan cannot pass the completion gate', () => {
+    const state = createInitialState({
+      sessionId: 's', runId: 'r', turnId: 't', workspaceRoot: 'workspace',
+      now: 0, mode: 'default',
+      budget: {
+        maxModelCalls: 10, maxToolCalls: 10, maxWallTimeMs: 10_000, maxTurns: 10,
+      },
+    })
+    state.tasks = [{
+      id: 'failed_task', planId: 'p', planVersion: 1, stepId: 'step_1',
+      subject: 'broken implementation', description: '', activeForm: 'repairing',
+      status: 'failed', dependsOn: [], acceptanceCriteria: [], evidenceIds: [],
+      revision: 2, createdAt: 't', updatedAt: 't',
+    }]
+    const approvedPlan = {
+      planId: 'p', version: 1, status: 'approved' as const, goal: 'finish safely',
+      nonGoals: [], assumptions: [], decisions: [], steps: [],
+      acceptanceCriteria: [], risks: [], createdAt: 't',
+    }
+    const result = evaluateCompletion({
+      state, approvedPlan, evidence: [], riskThreshold: 5,
+    })
+    expect(result.action).toBe('continue')
+    expect(result.missing).toContainEqual(expect.objectContaining({
+      kind: 'failed_tasks', detail: expect.stringContaining('failed_task'),
+    }))
+  })
+
+  test.each([false, true])(
+    'an open replan cannot complete (awaiting approval: %s)',
+    replanAwaitingApproval => {
+      const state = createInitialState({
+        sessionId: 's', runId: 'r', turnId: 't', workspaceRoot: 'workspace',
+        now: 0, mode: 'default',
+        budget: {
+          maxModelCalls: 10, maxToolCalls: 10, maxWallTimeMs: 10_000, maxTurns: 10,
+        },
+      })
+      state.recovery.replanning = true
+      state.recovery.replanAwaitingApproval = replanAwaitingApproval
+      const result = evaluateCompletion({
+        state, evidence: [], riskThreshold: 5,
+      })
+      expect(result.action).toBe('continue')
+      expect(result.missing).toContainEqual(expect.objectContaining({
+        kind: 'replan_in_progress',
+      }))
+    },
+  )
+
   test('a required manual criterion cannot silently complete without evidence', () => {
     expect(requiredCriteriaWithoutEvidence([MANUAL], [])).toEqual([MANUAL])
     const result = evaluateCompletion({
