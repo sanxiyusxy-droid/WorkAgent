@@ -49,13 +49,20 @@ export class RingBuffer {
     this.totalWritten += text.length
     this.chunks.push(text)
     this.length += text.length
-    while (this.length > this.capacity && this.chunks.length > 1) {
-      this.length -= this.chunks.shift()!.length
-    }
-    if (this.length > this.capacity && this.chunks.length === 1) {
-      const only = this.chunks[0]!
-      this.chunks[0] = only.slice(only.length - this.capacity)
-      this.length = this.chunks[0].length
+
+    let overflow = this.length - this.capacity
+    while (overflow > 0 && this.chunks.length > 0) {
+      const oldest = this.chunks[0]!
+      if (oldest.length <= overflow) {
+        this.chunks.shift()
+        this.length -= oldest.length
+        overflow -= oldest.length
+        continue
+      }
+
+      this.chunks[0] = oldest.slice(overflow)
+      this.length -= overflow
+      overflow = 0
     }
   }
 

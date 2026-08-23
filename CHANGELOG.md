@@ -4,6 +4,18 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.8.1] - 2026-08-23
+
+### Fixed
+- Changed the bounded Shell output buffer to trim exactly the overflowing
+  characters instead of discarding an entire stdout/stderr chunk. The retained
+  tail is now stable across operating-system and Node.js stream chunking, so a
+  small final chunk cannot erase almost all of the intended 100,000-character
+  context window or incorrectly bypass large-output externalization.
+- Added a deterministic chunk-boundary regression test covering the Windows
+  Node.js 20 failure mode while preserving the existing process-level Shell
+  checks.
+
 ## [1.8.0] - 2026-08-16
 
 ### Replay-stable adaptive policy

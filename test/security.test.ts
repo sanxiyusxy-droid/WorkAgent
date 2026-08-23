@@ -179,6 +179,24 @@ describe('RingBuffer output bound', () => {
     rb.write('abcdefghijklmnop')
     expect(rb.toString()).toBe('ghijklmnop')
   })
+
+  test('retained tail is independent of write chunk boundaries', () => {
+    const capacity = 100_000
+    const body = 'A'.repeat(150_000)
+    const marker = 'TAIL-MARKER'
+
+    const singleChunk = new RingBuffer(capacity)
+    singleChunk.write(body + marker)
+
+    const splitChunks = new RingBuffer(capacity)
+    splitChunks.write(body)
+    splitChunks.write(marker)
+
+    expect(splitChunks.toString()).toHaveLength(capacity)
+    expect(splitChunks.toString()).toBe(singleChunk.toString())
+    expect(splitChunks.toString().endsWith(marker)).toBe(true)
+    expect(splitChunks.overflowed).toBe(true)
+  })
 })
 
 describe('secret-scan script (no false green)', () => {
