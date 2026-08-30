@@ -799,7 +799,7 @@ describe('v1.6 local outcome calibration', () => {
       expect(resumed.state.outcomeCalibrationSelection).toEqual(selectionA)
 
       const snapshot = createSnapshot(resumed.state, 10)
-      expect(snapshot.version).toBe(4)
+      expect(snapshot.version).toBe(5)
       expect(snapshot.outcomeCalibrationSelection).toEqual(selectionA)
       const restored = restoreFromSnapshot(calibrationState(), snapshot)
       expect(restored.outcomeCalibrationSelection).toEqual(selectionA)

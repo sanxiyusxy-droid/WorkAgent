@@ -308,11 +308,31 @@ export type FactEvent =
   | { type: 'run.terminated'; terminal: TerminalReason }
   /** periodic full state snapshot for fast recovery */
   | { type: 'state.snapshot'; snapshot: StateSnapshot }
+  /**
+   * Durable pre-side-effect completion obligation. When
+   * durableBeforeExecution is true, ToolRuntime already flushed this exact
+   * fact before allowing the external operation to start; AgentEngine must
+   * reduce it without appending a duplicate journal entry.
+   */
+  | {
+      type: 'workspace.mutation.started'
+      mutationId: string
+      callId: string
+      toolName: string
+      scope: 'paths' | 'workspace'
+      paths: string[]
+      reason: string
+      durableBeforeExecution?: boolean
+    }
   /** write tools changed the workspace (drives scope tracking / replan) */
   | {
       type: 'workspace.changed'
       path: string
       change: 'created' | 'modified' | 'deleted'
+      /** links the observed change to its pre-side-effect obligation */
+      mutationId?: string
+      callId?: string
+      toolName?: string
     }
   /**
    * degraded recovery provenance (finish-list §1.5): this session is a
@@ -336,14 +356,15 @@ export type FactEvent =
  * recovery from a compatible snapshot is field-for-field equivalent to a full replay.
  * Version 3 adds policy-relevant plan scope, transition and pending verifier
  * repair fields. Version 4 adds the durable outcome-calibration selection.
- * Only V4 is used for snapshot-tail fast recovery; older
+ * Version 5 adds durable workspace-mutation verification obligations.
+ * Only V5 is used for snapshot-tail fast recovery; older
  * snapshots deliberately fall back to full replay.
  * Version 1 snapshots (message ids only) are still loadable but recovery
  * falls back to full replay when they are the only checkpoint.
  */
 export interface StateSnapshot {
-  /** snapshot schema version: V4 pins adaptive-policy provenance */
-  version?: 1 | 2 | 3 | 4
+  /** snapshot schema version: V5 also pins pending completion obligations */
+  version?: 1 | 2 | 3 | 4 | 5
   /** journal seq this snapshot was written after (V2+) */
   lastSeq?: number
   iteration: number
@@ -387,6 +408,22 @@ export interface StateSnapshot {
     planScopedTouchedFiles?: string[]
     createdFiles: string[]
     deletedFiles: string[]
+    /** V5: one increment per side-effect attempt, before execution. */
+    revision?: number
+    /** V5: survives context compaction, crash recovery and abnormal stops. */
+    pendingVerification?: {
+      revision: number
+      openedAtTurnId: string
+      scope: 'paths' | 'workspace'
+      changedPaths: string[]
+      sources: Array<{
+        mutationId: string
+        callId: string
+        toolName: string
+        outcome: 'unknown' | 'changed'
+        reason: string
+      }>
+    }
   }
   /** V1: message ids in order (messages themselves are in the journal) */
   messageIds: string[]
@@ -447,6 +484,7 @@ const FACT_TYPES = new Set<string>([
   'loop.transitioned',
   'run.terminated',
   'state.snapshot',
+  'workspace.mutation.started',
   'workspace.changed',
   'session.recovery.branch',
 ])

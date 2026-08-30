@@ -1238,9 +1238,9 @@ async function runRecoverySnapshot(
     const extraChecks = [
       check(
         'recovery',
-        'V4 snapshot is present',
-        loaded.lastSnapshot?.version === 4,
-        4,
+        'V5 snapshot is present',
+        loaded.lastSnapshot?.version === 5,
+        5,
         loaded.lastSnapshot?.version ?? 'missing',
       ),
       check(
@@ -1899,9 +1899,9 @@ async function runCalibrationResume(
       ),
       check(
         'recovery',
-        'V4 snapshot and full replay retain identical calibration state',
-        recovery.snapshotVersion === 4 && recovery.equivalent,
-        'V4 and equivalent states with pinned selection',
+        'V5 snapshot and full replay retain identical calibration state',
+        recovery.snapshotVersion === 5 && recovery.equivalent,
+        'V5 and equivalent states with pinned selection',
         recovery.equivalent
           ? `V${recovery.snapshotVersion}; tail ${recovery.tail}; equivalent`
           : recovery.difference ?? `V${recovery.snapshotVersion}; replay failure`,

@@ -74,6 +74,24 @@ export interface RunBudget {
   }
 }
 
+export interface WorkspaceMutationSource {
+  mutationId: string
+  callId: string
+  toolName: string
+  /** `unknown` includes an attempt that crashed before an observed fact. */
+  outcome: 'unknown' | 'changed'
+  reason: string
+}
+
+/** Durable state: context compaction cannot erase this obligation. */
+export interface PendingWorkspaceVerification {
+  revision: number
+  openedAtTurnId: string
+  scope: 'paths' | 'workspace'
+  changedPaths: string[]
+  sources: WorkspaceMutationSource[]
+}
+
 export interface AgentState {
   sessionId: string
   runId: string
@@ -105,6 +123,9 @@ export interface AgentState {
 
   workspace: {
     root: string
+    /** Incremented before each declared workspace side-effect attempt. */
+    revision: number
+    pendingVerification?: PendingWorkspaceVerification
     touchedFiles: string[]
     /** Reset on plan approval; preserves cumulative touchedFiles for audit. */
     planScopedTouchedFiles: string[]
@@ -167,6 +188,7 @@ export function createInitialState(input: {
     reflectionEvaluations: [],
     workspace: {
       root: input.workspaceRoot,
+      revision: 0,
       touchedFiles: [],
       planScopedTouchedFiles: [],
       createdFiles: [],
@@ -200,6 +222,32 @@ function withoutPendingVerificationRepair(state: AgentState): AgentState {
   const next = { ...state }
   delete next.pendingVerificationRepair
   return next
+}
+
+function withoutPendingWorkspaceVerification(state: AgentState): AgentState {
+  if (!state.workspace.pendingVerification) return state
+  const { pendingVerification: _pending, ...workspace } = state.workspace
+  return { ...state, workspace }
+}
+
+function normalizeWorkspacePaths(
+  state: AgentState,
+  paths: string[],
+): string[] {
+  const normalized: string[] = []
+  for (const candidate of paths) {
+    let path: string
+    try {
+      path = workspacePathKey(state.workspace.root, candidate)
+    } catch {
+      throw new InvariantError(
+        'workspace_change_outside_root',
+        `workspace mutation path is not inside the workspace: ${candidate}`,
+      )
+    }
+    if (!normalized.includes(path)) normalized.push(path)
+  }
+  return normalized
 }
 
 const REFLECTION_TRIGGERS = new Set<ReflectionRecord['trigger']>([
@@ -872,12 +920,74 @@ export function reduce(state: AgentState, event: FactEvent): AgentState {
       }
     }
 
-    case 'run.terminated':
-      return { ...state, phase: 'terminated' }
+    case 'run.terminated': {
+      const terminated = { ...state, phase: 'terminated' as const }
+      // Clean completion, including the explicit degraded terminal, closes
+      // the request boundary so a later unrelated human task is isolated.
+      // Crash/abort/budget/model failures intentionally retain the pending
+      // obligation for a recovery continuation.
+      return event.terminal.reason === 'completed' ||
+        event.terminal.reason === 'completed_with_unverified_items'
+        ? withoutPendingWorkspaceVerification(terminated)
+        : terminated
+    }
 
     case 'state.snapshot':
       // snapshots are recovery checkpoints; they don't change live state
       return state
+
+    case 'workspace.mutation.started': {
+      if (
+        !isNonEmptyString(event.mutationId) ||
+        !isNonEmptyString(event.callId) ||
+        !isNonEmptyString(event.toolName) ||
+        (event.scope !== 'paths' && event.scope !== 'workspace') ||
+        (event.scope === 'paths' && event.paths.length === 0)
+      ) {
+        throw new InvariantError(
+          'workspace_mutation_invalid',
+          'workspace mutation obligation has invalid identity or scope',
+        )
+      }
+      const prior = state.workspace.pendingVerification
+      if (prior?.sources.some(source => source.mutationId === event.mutationId)) {
+        throw new InvariantError(
+          'workspace_mutation_duplicate',
+          `duplicate workspace mutation obligation: ${event.mutationId}`,
+        )
+      }
+      const paths = normalizeWorkspacePaths(state, event.paths)
+      const revision = state.workspace.revision + 1
+      return withoutLastVerification({
+        ...state,
+        workspace: {
+          ...state.workspace,
+          revision,
+          pendingVerification: {
+            revision,
+            openedAtTurnId: prior?.openedAtTurnId ?? state.turnId,
+            scope:
+              prior?.scope === 'workspace' || event.scope === 'workspace'
+                ? 'workspace'
+                : 'paths',
+            changedPaths: [
+              ...(prior?.changedPaths ?? []),
+              ...paths.filter(path => !prior?.changedPaths.includes(path)),
+            ],
+            sources: [
+              ...(prior?.sources ?? []),
+              {
+                mutationId: event.mutationId,
+                callId: event.callId,
+                toolName: event.toolName,
+                outcome: 'unknown',
+                reason: event.reason,
+              },
+            ],
+          },
+        },
+      })
+    }
 
     case 'workspace.changed': {
       // maintain touched/created/deleted sets from write-tool facts
@@ -891,49 +1001,97 @@ export function reduce(state: AgentState, event: FactEvent): AgentState {
           `workspace.changed path is not inside the workspace: ${event.path}`,
         )
       }
-      const touched = pushUnique(state.workspace.touchedFiles, path)
-      const scopedTouched = pushUnique(state.workspace.planScopedTouchedFiles, path)
-      if (change === 'created') {
-        return withoutLastVerification({
+      let base = state
+      const pending = state.workspace.pendingVerification
+      const sourceIndex = event.mutationId
+        ? pending?.sources.findIndex(source => source.mutationId === event.mutationId) ?? -1
+        : -1
+      if (pending && sourceIndex >= 0) {
+        base = {
           ...state,
           workspace: {
             ...state.workspace,
+            pendingVerification: {
+              ...pending,
+              changedPaths: pushUnique(pending.changedPaths, path),
+              sources: pending.sources.map((source, index) =>
+                index === sourceIndex ? { ...source, outcome: 'changed' } : source,
+              ),
+            },
+          },
+        }
+      } else {
+        // Compatibility/fail-closed path for legacy or third-party tools that
+        // emitted a change without the new pre-side-effect contract.
+        const revision = state.workspace.revision + 1
+        base = {
+          ...state,
+          workspace: {
+            ...state.workspace,
+            revision,
+            pendingVerification: {
+              revision,
+              openedAtTurnId: pending?.openedAtTurnId ?? state.turnId,
+              scope: pending?.scope ?? 'paths',
+              changedPaths: pushUnique(pending?.changedPaths ?? [], path),
+              sources: [
+                ...(pending?.sources ?? []),
+                {
+                  mutationId:
+                    event.mutationId ?? `legacy:${event.callId ?? event.toolName ?? path}:${revision}`,
+                  callId: event.callId ?? 'legacy',
+                  toolName: event.toolName ?? 'unknown',
+                  outcome: 'changed',
+                  reason: 'workspace.changed was observed without a prepared obligation',
+                },
+              ],
+            },
+          },
+        }
+      }
+      const touched = pushUnique(base.workspace.touchedFiles, path)
+      const scopedTouched = pushUnique(base.workspace.planScopedTouchedFiles, path)
+      if (change === 'created') {
+        return withoutLastVerification({
+          ...base,
+          workspace: {
+            ...base.workspace,
             touchedFiles: touched,
             planScopedTouchedFiles: scopedTouched,
-            createdFiles: pushUnique(state.workspace.createdFiles, path),
-            deletedFiles: state.workspace.deletedFiles.filter(p => p !== path),
+            createdFiles: pushUnique(base.workspace.createdFiles, path),
+            deletedFiles: base.workspace.deletedFiles.filter(p => p !== path),
           },
           recovery: {
-            ...state.recovery,
-            lastProgressToolCalls: state.budget.used.toolCalls + 1,
+            ...base.recovery,
+            lastProgressToolCalls: base.budget.used.toolCalls + 1,
           },
         })
       }
       if (change === 'deleted') {
         return withoutLastVerification({
-          ...state,
+          ...base,
           workspace: {
-            ...state.workspace,
+            ...base.workspace,
             touchedFiles: touched,
             planScopedTouchedFiles: scopedTouched,
-            deletedFiles: pushUnique(state.workspace.deletedFiles, path),
+            deletedFiles: pushUnique(base.workspace.deletedFiles, path),
           },
           recovery: {
-            ...state.recovery,
-            lastProgressToolCalls: state.budget.used.toolCalls + 1,
+            ...base.recovery,
+            lastProgressToolCalls: base.budget.used.toolCalls + 1,
           },
         })
       }
       return withoutLastVerification({
-        ...state,
+        ...base,
         workspace: {
-          ...state.workspace,
+          ...base.workspace,
           touchedFiles: touched,
           planScopedTouchedFiles: scopedTouched,
         },
         recovery: {
-          ...state.recovery,
-          lastProgressToolCalls: state.budget.used.toolCalls + 1,
+          ...base.recovery,
+          lastProgressToolCalls: base.budget.used.toolCalls + 1,
         },
       })
     }
@@ -962,14 +1120,14 @@ export function applyFacts(state: AgentState, facts: FactEvent[]): AgentState {
 }
 
 /**
- * Create a serializable V4 snapshot of the current state: every field needed
+ * Create a serializable V5 snapshot of the current state: every field needed
  * to continue the run, including full message bodies and tool results.
- * Recovery from a V4 snapshot + tail replay must be field-for-field
+ * Recovery from a V5 snapshot + tail replay must be field-for-field
  * equivalent to a full journal replay.
  */
 export function createSnapshot(state: AgentState, lastSeq?: number): StateSnapshot {
   return {
-    version: 4,
+    version: 5,
     lastSeq,
     iteration: state.iteration,
     mode: state.mode,
@@ -987,6 +1145,16 @@ export function createSnapshot(state: AgentState, lastSeq?: number): StateSnapsh
       planScopedTouchedFiles: [...state.workspace.planScopedTouchedFiles],
       createdFiles: [...state.workspace.createdFiles],
       deletedFiles: [...state.workspace.deletedFiles],
+      revision: state.workspace.revision,
+      pendingVerification: state.workspace.pendingVerification
+        ? {
+            ...state.workspace.pendingVerification,
+            changedPaths: [...state.workspace.pendingVerification.changedPaths],
+            sources: state.workspace.pendingVerification.sources.map(source => ({
+              ...source,
+            })),
+          }
+        : undefined,
     },
     messageIds: state.messages.map(m => m.id),
     evidenceIds: [...state.evidenceIds],
@@ -1044,13 +1212,54 @@ export function createSnapshot(state: AgentState, lastSeq?: number): StateSnapsh
 
 /**
  * Restore state from a snapshot. V2+ snapshots restore full entities; V3 adds
- * current policy state and V4 pins adaptive-policy provenance. V1 snapshots restore scalars only and rely on
+ * current policy state, V4 pins adaptive-policy provenance and V5 adds
+ * pending workspace verification. V1 snapshots restore scalars only and rely on
  * the caller to backfill messages from the journal (or full replay).
  */
 export function restoreFromSnapshot(
   state: AgentState,
   snapshot: StateSnapshot,
 ): AgentState {
+  if (snapshot.version === 5) {
+    const revision = snapshot.workspace.revision
+    const pending = snapshot.workspace.pendingVerification as unknown
+    const validPending =
+      pending === undefined ||
+      (typeof pending === 'object' &&
+        pending !== null &&
+        isNonNegativeInteger(
+          (pending as PendingWorkspaceVerification).revision,
+        ) &&
+        (pending as PendingWorkspaceVerification).revision === revision &&
+        isNonEmptyString(
+          (pending as PendingWorkspaceVerification).openedAtTurnId,
+        ) &&
+        ((pending as PendingWorkspaceVerification).scope === 'paths' ||
+          (pending as PendingWorkspaceVerification).scope === 'workspace') &&
+        isStringArray(
+          (pending as PendingWorkspaceVerification).changedPaths,
+        ) &&
+        ((pending as PendingWorkspaceVerification).scope !== 'paths' ||
+          (pending as PendingWorkspaceVerification).changedPaths.length > 0) &&
+        Array.isArray((pending as PendingWorkspaceVerification).sources) &&
+        (pending as PendingWorkspaceVerification).sources.length > 0 &&
+        (pending as PendingWorkspaceVerification).sources.every(
+          source =>
+            typeof source === 'object' &&
+            source !== null &&
+            isNonEmptyString(source.mutationId) &&
+            isNonEmptyString(source.callId) &&
+            isNonEmptyString(source.toolName) &&
+            isNonEmptyString(source.reason) &&
+            (source.outcome === 'unknown' || source.outcome === 'changed'),
+        ))
+    if (!isNonNegativeInteger(revision) || !validPending) {
+      throw new InvariantError(
+        'workspace_mutation_invalid_snapshot',
+        'V5 snapshot contains an invalid workspace revision or pending verification obligation',
+      )
+    }
+  }
   const restored: AgentState = {
     ...state,
     iteration: snapshot.iteration,
@@ -1086,6 +1295,7 @@ export function restoreFromSnapshot(
     },
     workspace: {
       root: state.workspace.root,
+      revision: snapshot.version === 5 ? (snapshot.workspace.revision ?? 0) : 0,
       touchedFiles: [...snapshot.workspace.touchedFiles],
       // Older V2 snapshots predate plan-scoped tracking. Treat their current
       // contents as the approval baseline rather than falsely locking writes.
@@ -1094,6 +1304,19 @@ export function restoreFromSnapshot(
       ],
       createdFiles: [...snapshot.workspace.createdFiles],
       deletedFiles: [...snapshot.workspace.deletedFiles],
+      ...(snapshot.version === 5 && snapshot.workspace.pendingVerification
+        ? {
+            pendingVerification: {
+              ...snapshot.workspace.pendingVerification,
+              changedPaths: [
+                ...snapshot.workspace.pendingVerification.changedPaths,
+              ],
+              sources: snapshot.workspace.pendingVerification.sources.map(
+                source => ({ ...source }),
+              ),
+            },
+          }
+        : {}),
     },
     evidenceIds: [...snapshot.evidenceIds],
   }
@@ -1105,7 +1328,8 @@ export function restoreFromSnapshot(
   if (
     snapshot.version === 2 ||
     snapshot.version === 3 ||
-    snapshot.version === 4
+    snapshot.version === 4 ||
+    snapshot.version === 5
   ) {
     restored.messages = [...(snapshot.messages ?? [])]
     restored.pendingToolCalls = [...(snapshot.pendingToolCalls ?? [])]
@@ -1156,7 +1380,10 @@ export function restoreFromSnapshot(
     if (snapshot.pendingVerificationRepair) {
       restored.pendingVerificationRepair = snapshot.pendingVerificationRepair
     }
-    if (snapshot.version === 4 && snapshot.outcomeCalibrationSelection) {
+    if (
+      (snapshot.version === 4 || snapshot.version === 5) &&
+      snapshot.outcomeCalibrationSelection
+    ) {
       if (!isOutcomeCalibrationSelection(snapshot.outcomeCalibrationSelection)) {
         throw new InvariantError(
           'outcome_calibration_invalid_snapshot',

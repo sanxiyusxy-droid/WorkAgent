@@ -41,6 +41,16 @@ export interface ResourceClaim {
 }
 
 /**
+ * Workspace-side-effect declaration used by the durable completion gate.
+ * `paths` is used when a tool can determine every target before execution;
+ * `workspace` deliberately fails closed for commands whose exact write set
+ * cannot be known without observing the process.
+ */
+export type WorkspaceMutationIntent =
+  | { scope: 'paths'; paths: string[]; reason?: string }
+  | { scope: 'workspace'; reason: string }
+
+/**
  * Runtime services available to tools. Tools never touch engine state
  * directly; they call services and return declarative facts.
  */
@@ -101,12 +111,20 @@ export interface ToolDefinition<Input = unknown, Output = unknown> {
   readonly maxResultChars: number
   /** duplicate-execution policy; defaults to 'operation' */
   readonly idempotencyScope: IdempotencyScope
+  /** True when the tool author supplied resource claims instead of defaults. */
+  readonly resourcesExplicit?: boolean
 
   readOnly(input: Input): boolean
   destructive(input: Input): boolean
   concurrency(input: Input): ConcurrencyClass
   resources(input: Input, ctx: ToolContext): ResourceClaim[]
   interruptBehavior(input: Input): InterruptBehavior
+
+  /** Declarative write intent. Evaluated after validation/idempotency checks. */
+  workspaceMutation(
+    input: Input,
+    ctx: ToolContext,
+  ): WorkspaceMutationIntent | undefined
 
   validate(input: Input, ctx: ToolContext): Promise<ValidationResult>
   /** Runtime-enforced assertions evaluated immediately before execution. */
@@ -159,6 +177,10 @@ export interface ToolSpec<Input, Output> {
   concurrency?: (input: Input) => ConcurrencyClass
   resources?: (input: Input, ctx: ToolContext) => ResourceClaim[]
   interruptBehavior?: (input: Input) => InterruptBehavior
+  workspaceMutation?: (
+    input: Input,
+    ctx: ToolContext,
+  ) => WorkspaceMutationIntent | undefined
   validate?: (input: Input, ctx: ToolContext) => Promise<ValidationResult>
   preconditions?: (
     input: Input,
@@ -199,12 +221,14 @@ export function defineTool<Input, Output>(
     inputSchema: spec.inputSchema,
     maxResultChars: spec.maxResultChars ?? 30_000,
     idempotencyScope: spec.idempotencyScope ?? 'operation',
+    resourcesExplicit: spec.resources !== undefined,
     readOnly: spec.readOnly ?? (() => false),
     destructive: spec.destructive ?? (() => false),
     concurrency: spec.concurrency ?? (() => 'exclusive'),
     resources:
       spec.resources ?? (() => [{ resource: 'workspace:*', mode: 'write' }]),
     interruptBehavior: spec.interruptBehavior ?? (() => 'block'),
+    workspaceMutation: spec.workspaceMutation ?? (() => undefined),
     validate: spec.validate ?? (async () => ({ ok: true })),
     preconditions: spec.preconditions ?? (async () => []),
     permission: spec.permission ?? (async () => ({ behavior: 'ask' })),

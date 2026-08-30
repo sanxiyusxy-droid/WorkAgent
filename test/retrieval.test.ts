@@ -1,4 +1,12 @@
-import { mkdir, mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises'
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  symlink,
+  unlink,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, test } from 'vitest'
@@ -6,6 +14,8 @@ import { mergeConfig } from '../src/app/config.js'
 import { CodeRetriever, chunkDocument } from '../src/retrieval/CodeRetriever.js'
 import { planRetrievalQuery } from '../src/retrieval/QueryPlanner.js'
 import { textTurn, toolCallTurn } from '../src/model/ScriptedModel.js'
+import { RefreshCodeIndexTool } from '../src/tools/builtin/RetrievalTools.js'
+import type { ToolContext } from '../src/tools/Tool.js'
 import { collectRun, makeWorld, stateWithUser } from './helpers.js'
 
 describe('v1.2/v1.3 code retrieval and context graph', () => {
@@ -246,6 +256,45 @@ describe('v1.2/v1.3 code retrieval and context graph', () => {
       expect(after.sourceId).not.toBe(before.sourceId)
     } finally {
       await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test('explicit refresh rejects a symlink or junction escaping the workspace', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'agent-retrieval-'))
+    const outside = await mkdtemp(join(tmpdir(), 'agent-retrieval-outside-'))
+    try {
+      await writeFile(
+        join(outside, 'outside.ts'),
+        'export const outsideWorkspace = true\n',
+        'utf8',
+      )
+      await symlink(
+        outside,
+        join(root, 'linked'),
+        process.platform === 'win32' ? 'junction' : 'dir',
+      )
+
+      const retriever = new CodeRetriever(root, {
+        persistence: false,
+        refreshOnSearch: false,
+      })
+      const validation = await RefreshCodeIndexTool.validate(
+        { paths: ['linked/outside.ts'] },
+        { workspaceRoot: root } as ToolContext,
+      )
+      expect(validation).toMatchObject({
+        ok: false,
+        error: {
+          code: 'SEMANTIC_VALIDATION_ERROR',
+          message: 'refresh path rejected: symlink_escape',
+        },
+      })
+      await expect(retriever.refresh(['linked/outside.ts']))
+        .rejects.toThrow('refresh path rejected: symlink_escape')
+      expect(await retriever.status()).toMatchObject({ initialized: false, files: 0 })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+      await rm(outside, { recursive: true, force: true })
     }
   })
 

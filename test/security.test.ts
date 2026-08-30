@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'vitest'
 import { execFile } from 'node:child_process'
-import { mkdtemp, mkdir, rm, symlink, writeFile, readFile } from 'node:fs/promises'
+import { copyFile, mkdtemp, mkdir, rm, symlink, writeFile, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
@@ -18,7 +18,9 @@ import type { ToolContext } from '../src/tools/Tool.js'
 
 const execFileAsync = promisify(execFile)
 
-const FAKE_KEY = 'sk-fake99887766554433221100aabbccdd'
+// Assemble test credentials at runtime so the repository's own secret scan
+// can inspect this file instead of exempting it wholesale.
+const FAKE_KEY = ['sk', '-', 'fake99887766554433221100aabbccdd'].join('')
 
 function makeCtx(workspaceRoot: string): ToolContext {
   return {
@@ -42,15 +44,19 @@ describe('credential sanitization', () => {
   })
 
   test('sanitize covers github tokens, aws keys and generic assignments', () => {
+    const githubToken = ['ghp', '_', 'a'.repeat(36)].join('')
+    const awsKey = ['AKIA', 'A'.repeat(15), '1'].join('')
+    const genericValue = ['super', 'secretvalue12345678'].join('')
+    const genericAssignment = ['api', '_key = "', genericValue, '"'].join('')
     const text = [
-      'ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-      'AKIAAAAAAAAAAAAAAAA1',
-      'api_key = "supersecretvalue12345678"',
+      githubToken,
+      awsKey,
+      genericAssignment,
     ].join('\n')
     const out = sanitize(text)
-    expect(out).not.toContain('ghp_aaaa')
-    expect(out).not.toContain('AKIAAAAAAAAAAAAAAAA1')
-    expect(out).not.toContain('supersecretvalue12345678')
+    expect(out).not.toContain(githubToken)
+    expect(out).not.toContain(awsKey)
+    expect(out).not.toContain(genericValue)
   })
 
   test('redactDeep walks nested objects and arrays', () => {
@@ -202,6 +208,26 @@ describe('RingBuffer output bound', () => {
 describe('secret-scan script (no false green)', () => {
   const script = new URL('../scripts/secret-scan.mjs', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')
 
+  async function makeCleanGitRepo(): Promise<{ dir: string; copiedScript: string }> {
+    const dir = await mkdtemp(join(tmpdir(), 'agent-scan-git-'))
+    const copiedScript = join(dir, 'scripts', 'secret-scan.mjs')
+    await mkdir(join(dir, 'scripts'), { recursive: true })
+    await copyFile(script, copiedScript)
+    await writeFile(join(dir, 'clean.ts'), 'export const clean = true\n')
+    await execFileAsync('git', ['init', '--quiet'], { cwd: dir })
+    await execFileAsync('git', ['add', 'scripts/secret-scan.mjs', 'clean.ts'], { cwd: dir })
+    await execFileAsync(
+      'git',
+      [
+        '-c', 'user.name=Code Agent Test',
+        '-c', 'user.email=code-agent@example.invalid',
+        'commit', '--quiet', '--no-gpg-sign', '-m', 'fixture',
+      ],
+      { cwd: dir },
+    )
+    return { dir, copiedScript }
+  }
+
   test('detects a planted secret and exits non-zero', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'agent-scan-'))
     try {
@@ -225,6 +251,334 @@ describe('secret-scan script (no false green)', () => {
       await execFileAsync('node', [script, '--dir', dir])
     } finally {
       await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('a genuine non-Git project falls back to a full tree scan', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'agent-scan-nongit-'))
+    try {
+      const copiedScript = join(dir, 'scripts', 'secret-scan.mjs')
+      await mkdir(join(dir, 'scripts'), { recursive: true })
+      await copyFile(script, copiedScript)
+      await writeFile(join(dir, 'planted'), `credential ${FAKE_KEY}\n`)
+
+      let failure: { code?: number; stdout?: string; stderr?: string } | undefined
+      try {
+        await execFileAsync('node', [copiedScript], { cwd: dir })
+      } catch (error) {
+        failure = error as { code?: number; stdout?: string; stderr?: string }
+      }
+      expect(failure?.code).toBe(1)
+      expect(failure?.stdout).toContain('not a git repository')
+      expect(failure?.stderr).toContain('planted')
+      expect(failure?.stderr).not.toContain(FAKE_KEY)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('fails closed for an empty directory unless explicitly allowed', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'agent-scan-empty-'))
+    try {
+      let failure: { code?: number; stderr?: string } | undefined
+      try {
+        await execFileAsync('node', [script, '--dir', dir])
+      } catch (error) {
+        failure = error as { code?: number; stderr?: string }
+      }
+      expect(failure?.code).toBe(2)
+      expect(failure?.stderr).toContain('no files selected')
+
+      const allowed = await execFileAsync('node', [script, '--dir', dir, '--allow-empty'])
+      expect(allowed.stdout).toContain('intentionally allowed')
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('a clean Git checkout cannot pass through the empty staged selection', async () => {
+    const { dir, copiedScript } = await makeCleanGitRepo()
+    try {
+      let failure: { code?: number; stderr?: string } | undefined
+      try {
+        await execFileAsync('node', [copiedScript], { cwd: dir })
+      } catch (error) {
+        failure = error as { code?: number; stderr?: string }
+      }
+      expect(failure?.code).toBe(2)
+      expect(failure?.stderr).toContain('staged files')
+
+      const tracked = await execFileAsync('node', [copiedScript, '--all'], { cwd: dir })
+      expect(tracked.stdout).toContain('tracked files')
+      expect(tracked.stdout).toContain('2 text file(s)')
+
+      const precommit = await execFileAsync(
+        'node', [copiedScript, '--staged', '--allow-empty'], { cwd: dir },
+      )
+      expect(precommit.stdout).toContain('intentionally allowed')
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('a Git selector failure fails closed instead of scanning the working tree', async () => {
+    const { dir, copiedScript } = await makeCleanGitRepo()
+    try {
+      // rev-parse does not require the index, so repository detection succeeds;
+      // the subsequent staged selector must treat this corruption as fatal.
+      await writeFile(join(dir, '.git', 'index'), Buffer.from('corrupt-index'))
+
+      let failure: { code?: number; stdout?: string; stderr?: string } | undefined
+      try {
+        await execFileAsync('node', [copiedScript, '--staged'], { cwd: dir })
+      } catch (error) {
+        failure = error as { code?: number; stdout?: string; stderr?: string }
+      }
+      expect(failure?.code).toBe(2)
+      expect(failure?.stderr).toContain('Git staged selection failed')
+      expect(failure?.stdout).not.toContain('scanning full project tree')
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('staged mode scans the index blob when the working tree copy is clean', async () => {
+    const { dir, copiedScript } = await makeCleanGitRepo()
+    try {
+      await writeFile(join(dir, 'staged.ts'), `export const key = '${FAKE_KEY}'\n`)
+      await execFileAsync('git', ['add', 'staged.ts'], { cwd: dir })
+      await writeFile(join(dir, 'staged.ts'), 'export const key = "clean"\n')
+
+      let failure: { code?: number; stderr?: string } | undefined
+      try {
+        await execFileAsync('node', [copiedScript, '--staged'], { cwd: dir })
+      } catch (error) {
+        failure = error as { code?: number; stderr?: string }
+      }
+      expect(failure?.code).toBe(1)
+      expect(failure?.stderr).toContain('staged.ts')
+      expect(failure?.stderr).not.toContain(FAKE_KEY)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('staged rename paths are selected and read from their index blobs', async () => {
+    const { dir, copiedScript } = await makeCleanGitRepo()
+    try {
+      await writeFile(join(dir, 'before.ts'), `export const key = '${FAKE_KEY}'\n`)
+      await execFileAsync('git', ['add', 'before.ts'], { cwd: dir })
+      await execFileAsync(
+        'git',
+        [
+          '-c', 'user.name=Code Agent Test',
+          '-c', 'user.email=code-agent@example.invalid',
+          'commit', '--quiet', '--no-gpg-sign', '-m', 'rename source',
+        ],
+        { cwd: dir },
+      )
+      await execFileAsync('git', ['mv', 'before.ts', 'after.ts'], { cwd: dir })
+
+      let failure: { code?: number; stderr?: string } | undefined
+      try {
+        await execFileAsync('node', [copiedScript, '--staged'], { cwd: dir })
+      } catch (error) {
+        failure = error as { code?: number; stderr?: string }
+      }
+      expect(failure?.code).toBe(1)
+      expect(failure?.stderr).toContain('after.ts')
+      expect(failure?.stderr).not.toContain(FAKE_KEY)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('staged type changes are selected and read from their index blobs', async () => {
+    const { dir, copiedScript } = await makeCleanGitRepo()
+    try {
+      await writeFile(join(dir, 'typed.ts'), 'export const clean = true\n')
+      await execFileAsync('git', ['add', 'typed.ts'], { cwd: dir })
+      await execFileAsync(
+        'git',
+        [
+          '-c', 'user.name=Code Agent Test',
+          '-c', 'user.email=code-agent@example.invalid',
+          'commit', '--quiet', '--no-gpg-sign', '-m', 'type source',
+        ],
+        { cwd: dir },
+      )
+
+      const blobSource = join(dir, 'type-blob.txt')
+      await writeFile(blobSource, FAKE_KEY)
+      const hashed = await execFileAsync('git', ['hash-object', '-w', 'type-blob.txt'], { cwd: dir })
+      await execFileAsync(
+        'git',
+        ['update-index', '--cacheinfo', '120000', hashed.stdout.trim(), 'typed.ts'],
+        { cwd: dir },
+      )
+
+      let failure: { code?: number; stderr?: string } | undefined
+      try {
+        await execFileAsync('node', [copiedScript, '--staged'], { cwd: dir })
+      } catch (error) {
+        failure = error as { code?: number; stderr?: string }
+      }
+      expect(failure?.code).toBe(1)
+      expect(failure?.stderr).toContain('typed.ts')
+      expect(failure?.stderr).not.toContain(FAKE_KEY)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('scans extensionless, multi-suffix, and uppercase text while skipping NUL binary', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'agent-scan-text-'))
+    try {
+      await writeFile(join(dir, 'LICENSE'), `license ${FAKE_KEY}\n`)
+      await writeFile(join(dir, 'launcher'), `launcher ${FAKE_KEY}\n`)
+      await writeFile(join(dir, '.env.local'), `API_KEY=${FAKE_KEY}\n`)
+      await writeFile(join(dir, 'UPPER.TS'), `export const key = '${FAKE_KEY}'\n`)
+      await writeFile(join(dir, 'binary.dat'), Buffer.concat([
+        Buffer.from([0]), Buffer.from(FAKE_KEY, 'utf8'),
+      ]))
+
+      let failure: { code?: number; stderr?: string } | undefined
+      try {
+        await execFileAsync('node', [script, '--dir', dir])
+      } catch (error) {
+        failure = error as { code?: number; stderr?: string }
+      }
+      expect(failure?.code).toBe(1)
+      expect(failure?.stderr).toContain('LICENSE')
+      expect(failure?.stderr).toContain('launcher')
+      expect(failure?.stderr).toContain('.env.local')
+      expect(failure?.stderr).toContain('UPPER.TS')
+      expect(failure?.stderr).not.toContain('binary.dat')
+      expect(failure?.stderr).not.toContain(FAKE_KEY)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('directory discovery applies excluded names case-insensitively', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'agent-scan-excluded-case-'))
+    try {
+      await writeFile(join(dir, 'clean'), 'no credential here\n')
+      await mkdir(join(dir, 'NODE_MODULES'))
+      await writeFile(join(dir, 'NODE_MODULES', 'dependency'), FAKE_KEY)
+
+      const result = await execFileAsync('node', [script, '--dir', dir])
+      expect(result.stdout).toContain('1 text file(s)')
+      expect(result.stdout).not.toContain('NODE_MODULES')
+      expect(result.stderr).toBe('')
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('directory discovery fails closed when a link resolves outside the scan root', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'agent-scan-dir-link-'))
+    const outside = await mkdtemp(join(tmpdir(), 'agent-scan-dir-outside-'))
+    try {
+      const copiedScript = join(dir, 'scripts', 'secret-scan.mjs')
+      await mkdir(join(dir, 'scripts'), { recursive: true })
+      await copyFile(script, copiedScript)
+      await writeFile(join(dir, 'clean'), 'no credential here\n')
+      await writeFile(join(outside, 'secret'), FAKE_KEY)
+      try {
+        await symlink(
+          outside,
+          join(dir, 'escape'),
+          process.platform === 'win32' ? 'junction' : 'dir',
+        )
+      } catch {
+        return // The environment may prohibit creation of directory links.
+      }
+
+      let failure: { code?: number; stderr?: string } | undefined
+      try {
+        await execFileAsync('node', [copiedScript], { cwd: dir })
+      } catch (error) {
+        failure = error as { code?: number; stderr?: string }
+      }
+      expect(failure?.code).toBe(2)
+      expect(failure?.stderr).toContain('resolves outside scan root')
+      expect(failure?.stderr).not.toContain(FAKE_KEY)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+      await rm(outside, { recursive: true, force: true })
+    }
+  })
+
+  test('a nested allowlist-looking suffix is still scanned', async () => {
+    const { dir, copiedScript } = await makeCleanGitRepo()
+    try {
+      const nested = join(dir, 'nested', 'test')
+      await mkdir(nested, { recursive: true })
+      await writeFile(join(nested, 'security.test.ts'), `export const key = '${FAKE_KEY}'\n`)
+      await execFileAsync('git', ['add', 'nested/test/security.test.ts'], { cwd: dir })
+
+      let failure: { code?: number; stderr?: string } | undefined
+      try {
+        await execFileAsync('node', [copiedScript, '--all'], { cwd: dir })
+      } catch (error) {
+        failure = error as { code?: number; stderr?: string }
+      }
+      expect(failure?.code).toBe(1)
+      expect(failure?.stderr).toContain('nested/test/security.test.ts')
+      expect(failure?.stderr).not.toContain(FAKE_KEY)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('package mode scans untracked build output without printing the secret', async () => {
+    const { dir, copiedScript } = await makeCleanGitRepo()
+    try {
+      await mkdir(join(dir, 'dist'))
+      await writeFile(join(dir, 'dist', 'agent'), `launcher ${FAKE_KEY}\n`)
+      let failure: { code?: number; stderr?: string } | undefined
+      try {
+        await execFileAsync(
+          'node', [copiedScript, '--all', '--include-dir', 'dist'], { cwd: dir },
+        )
+      } catch (error) {
+        failure = error as { code?: number; stderr?: string }
+      }
+      expect(failure?.code).toBe(1)
+      expect(failure?.stderr).toContain('dist/agent')
+      expect(failure?.stderr).not.toContain(FAKE_KEY)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('rejects a Git-tracked symlink that resolves outside the scan root', async () => {
+    const { dir, copiedScript } = await makeCleanGitRepo()
+    const outside = await mkdtemp(join(tmpdir(), 'agent-scan-outside-'))
+    try {
+      const outsideFile = join(outside, 'leak.ts')
+      const linkedFile = join(dir, 'linked.ts')
+      await writeFile(outsideFile, `export const key = '${FAKE_KEY}'\n`)
+      try {
+        await symlink(outsideFile, linkedFile, 'file')
+      } catch {
+        return // Windows may require Developer Mode or elevated symlink rights.
+      }
+      await execFileAsync('git', ['add', 'linked.ts'], { cwd: dir })
+
+      let failure: { code?: number; stderr?: string } | undefined
+      try {
+        await execFileAsync('node', [copiedScript, '--all'], { cwd: dir })
+      } catch (error) {
+        failure = error as { code?: number; stderr?: string }
+      }
+      expect(failure?.code).toBe(2)
+      expect(failure?.stderr).toContain('resolves outside scan root')
+      expect(failure?.stderr).not.toContain(FAKE_KEY)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+      await rm(outside, { recursive: true, force: true })
     }
   })
 })

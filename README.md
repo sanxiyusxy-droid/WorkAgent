@@ -13,9 +13,10 @@ user goal → plan → tool calls → independent verification → evidence rece
 
 - **Replayable durable state.** Durable facts (messages, tool lifecycle,
   plans, evidence and snapshots) use an append-only JSONL journal with
-  sequence, known-fact and per-event checksum validation. V4 snapshot-plus-tail and full
-  replay are field-for-field equivalent for valid journals; transient UI
-  events and arbitrary power-loss windows are outside that claim.
+  sequence, known-fact and per-event checksum validation. V5
+  snapshot-plus-tail and full replay are field-for-field equivalent for valid
+  journals; V1-V4 snapshots deliberately use full replay. Transient UI events
+  and arbitrary power-loss windows are outside that claim.
 - **Scoped side-effect deduplication.** Operation-scoped file mutations reuse
   durable ledger proof when it still matches external state. Shell is
   invocation-scoped, and an uncertain result without a safe outcome inspector
@@ -51,6 +52,14 @@ user goal → plan → tool calls → independent verification → evidence rece
 - **Enforced tool contracts.** Every call produces machine-readable
   preconditions, postconditions and an observation. File writes verify their
   committed version; failed postconditions remain explicitly uncertain.
+- **Durable mutation completion.** Before a workspace side effect can begin,
+  the runtime synchronously records `workspace.mutation.started` and opens a
+  revision-bound verification obligation. It covers file tools, Shell and
+  custom tools that claim workspace-write resources, and survives compaction,
+  failed postconditions, interrupted execution, recovery and abnormal stops.
+  Clean completion requires relevant runtime evidence for the current
+  session/run/root/revision and every known changed path; an independent
+  verifier cannot substitute for that first-level proof.
 - **Plan supervision and loop intelligence.** A deterministic supervisor scores
   plan health from task, evidence, scope, failure and budget facts, then emits a
   typed next action. Reflections declare success signals and are evaluated
@@ -67,12 +76,13 @@ user goal → plan → tool calls → independent verification → evidence rece
 - **Workspace-local outcome calibration.** Valid historical reflection outcomes
   are grouped by trigger and typed Supervisor action with a minimum-sample gate.
   A full profile, source manifest and cutoff are selected once and journaled
-  before use, then restored from V4 snapshots instead of rescanning mutable
-  history. Single-flight reflection evaluation prevents no-progress samples
-  from being overwritten. The bounded one-call window adjustment may shift
-  when later deterministic repair policy reacts, but cannot expand authority
-  or bypass safety, evidence, verification, approval, scope, budget or
-  completion rules.
+  before use. V4 introduced snapshotting for that provenance; the current V5
+  snapshot retains it alongside durable mutation obligations instead of
+  rescanning mutable history. Single-flight reflection evaluation prevents
+  no-progress samples from being overwritten. The bounded one-call window
+  adjustment may shift when later deterministic repair policy reacts, but
+  cannot expand authority or bypass safety, evidence, verification, approval,
+  scope, budget or completion rules.
 - **Deterministic Agent evaluation.** Fourteen declarative offline scenarios run the
   real engine, tools, policy, journal and recovery paths twice, then gate
   correctness, safety, recovery, planning/reflection policy, budgets and fact-
@@ -88,6 +98,12 @@ run it with privileges you would not give to a human at the same terminal.
 Credentials are redacted from every output path (terminal, journal,
 artifacts), and an environment allowlist keeps the child environment
 minimal — but treat your API key and workspace as sensitive regardless.
+Model credentials and network routes are resolved as an **atomic trust
+bundle**: an environment API key is never combined with provider, model or
+base URL fields supplied by a project config. The setup prompt also suppresses
+terminal echo and readline-history retention while an API key is entered,
+restores the previous history afterward, and atomically replaces the stored
+model bundle so an obsolete route cannot linger.
 
 ## Install
 
@@ -116,18 +132,36 @@ code-agent sessions               # list resumable sessions
 
 Providers: any OpenAI-compatible endpoint or Anthropic (the Anthropic
 channel is implemented but not yet verified against the live API — see
-CHANGELOG). Configuration is picked up in this precedence order:
+CHANGELOG). Runtime settings keep first-file precedence:
 
 ```
-environment variables > --config <file> > <workspace>/agent.config.json
-> ~/.code-agent/config.json > installation directory
+CLI/environment overrides > --config/AGENT_CONFIG
+> <workspace>/agent.config.json > ~/.code-agent/config.json > installation directory
 ```
+
+Model connections use a separate trust-source order: an atomic environment
+bundle, then `--config`/`AGENT_CONFIG`, user config, workspace config and the
+installation directory. Runtime-only files are skipped during model selection;
+the first file containing any model field owns the complete bundle, with no
+cross-file merging. An incomplete owning bundle fails closed with a targeted
+configuration error.
 
 Key environment variables: `AGENT_API_KEY`, `AGENT_MODEL`,
 `AGENT_PROVIDER` (`openai` | `anthropic`), `AGENT_BASE_URL`,
-`AGENT_MODE`, `AGENT_MAX_TURNS`, and optionally
-`AGENT_VERIFIER_PROVIDER` / `AGENT_VERIFIER_MODEL` to run the independent
-verifier on a different model.
+`AGENT_MODE`, and `AGENT_MAX_TURNS`. Model connection variables are atomic:
+if any main `AGENT_API_KEY` / `AGENT_MODEL` / `AGENT_PROVIDER` /
+`AGENT_BASE_URL` variable is set, at least `AGENT_API_KEY` and `AGENT_MODEL`
+must be supplied by the environment and all file model fields are ignored.
+This prevents a repository-controlled endpoint from receiving an environment
+credential.
+
+`AGENT_VERIFIER_MODEL` alone safely reuses the main model's exact credential
+and route. To change the verifier provider or endpoint, configure an isolated
+bundle with `AGENT_VERIFIER_API_KEY`, `AGENT_VERIFIER_MODEL`, and optionally
+`AGENT_VERIFIER_PROVIDER` / `AGENT_VERIFIER_BASE_URL`; the main key is never
+forwarded to a changed route. See
+[`docs/model-configuration.md`](docs/model-configuration.md) for examples and
+the complete trust-source rules.
 
 `agent.config.json` also accepts `intelligence` (enable flag, reflection
 interval/evaluation window, optional completion-reflection pass and local
@@ -141,7 +175,8 @@ calibration and its policy boundary, and
 [`docs/v1.7-architecture.md`](docs/v1.7-architecture.md) for action-aware tool
 projection and runtime enforcement, and
 [`docs/v1.8-architecture.md`](docs/v1.8-architecture.md) for replay-stable
-adaptive-policy provenance and single-flight reflection feedback.
+adaptive-policy provenance, V5 recovery, durable mutation completion and
+release gates.
 
 ## Permissions
 
@@ -175,14 +210,18 @@ are rejected.
 
 - Sessions live in `<workspace>/.agent/sessions/<id>/journal.jsonl`.
 - On resume, the loader uses the newest valid snapshot and replays the
-  tail; without a compatible V4 snapshot it replays everything. V4
-  snapshot-plus-tail and full replay converge on the same reducer. Older V2
-  and V3 snapshots deliberately fall back to full replay rather than inventing
-  newer policy/provenance state.
+  tail only when it is a compatible V5 checkpoint. V5 snapshot-plus-tail and
+  full replay converge on the same reducer. V1-V4 snapshots deliberately fall
+  back to full replay rather than hiding newer policy, provenance or mutation-
+  verification state.
 - Tool calls interrupted mid-flight are closed with a synthetic result and
   marked for inspection. A partially accepted multi-call assistant turn is
   protocol-closed on resume without executing calls that were never accepted.
   The agent does not assume an unknown side effect happened or did not happen.
+- A pending workspace-verification obligation survives recovery and abnormal
+  termination. A normal `completed` or
+  `completed_with_unverified_items` terminal closes that request boundary so a
+  later unrelated user task does not inherit the prior obligation.
 
 ## Architecture
 
@@ -213,18 +252,28 @@ progress, deltas) are never persisted, so replay never depends on them.
 npm run typecheck     # tsc --noEmit
 npm test              # vitest (300+ tests, incl. recovery, RAG & escape suites)
 npm run test:cov      # coverage with per-module regression floors
-npm run secret-scan   # credential scan (fails on findings, even without git)
+npm run secret-scan   # exact staged Git-index blobs; unexpected empty fails closed
+npm run precommit     # staged scan that deliberately permits no eligible changes
+npm run secret-scan:all # tracked files; extensionless included, NUL binaries skipped
+npm run secret-scan:package # tracked files + built dist/ under the same fail-closed scan
+npm run check:release-tag -- --tag v1.8.2 # tag must equal package version
 npm run build         # bundle dist/agent.mjs, embeds the source commit
 npm run eval          # deterministic Agent + recovery gate (no API key)
 npm run eval:faults   # deterministic fault scenarios only
 npm run eval:retrieval # offline Recall@K/MRR/citation/freshness benchmark
 npm run eval:all      # deterministic Agent gate + retrieval benchmark
+npm run eval:ci       # both offline gates without writing eval/results artifacts
 npm run eval:live     # fixture tasks against a real model (needs API key)
 npm run smoke:anthropic # bounded live Anthropic stream check (needs Anthropic config)
 ```
 
-CI runs typecheck, tests, secret scan and build on Windows, Linux and
-macOS, plus coverage regression gates on Node 22.
+CI runs typecheck, tests, build, a fail-closed tracked/package secret scan and
+package-install checks on Windows, Linux and macOS, plus a Node 22 coverage
+gate. One Ubuntu Node 22 job verifies the release tag and executes a standard
+`npm pack` lifecycle, so `prepack` really runs both deterministic no-write
+Agent/RAG evaluations and every release check before the tarball allowlist is
+compared. Matrix install checks use `npm pack --ignore-scripts` only to avoid
+repeating that lifecycle six additional times.
 
 ## Limitations
 

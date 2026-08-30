@@ -1,6 +1,6 @@
 {
   "name": "code-agent",
-  "version": "1.8.1",
+  "version": "1.8.2",
   "description": "A resumable, contract-driven CLI code agent",
   "repository": {
     "type": "git",
@@ -39,16 +39,21 @@
     "test:cov": "vitest run --coverage",
     "test:watch": "vitest",
     "secret-scan": "node scripts/secret-scan.mjs",
+    "secret-scan:staged": "node scripts/secret-scan.mjs --staged --allow-empty",
+    "secret-scan:all": "node scripts/secret-scan.mjs --all",
+    "secret-scan:package": "node scripts/secret-scan.mjs --all --include-dir dist",
     "check:package": "node scripts/check-package.mjs",
-    "prepack": "npm run typecheck && npm test && npm run secret-scan && npm run build && npm run check:package",
+    "check:release-tag": "node scripts/check-release-tag.mjs",
+    "prepack": "npm run typecheck && npm test && npm run eval:ci && npm run build && npm run secret-scan:package && npm run check:package",
     "eval": "tsx eval/agent-eval.ts",
     "eval:agent": "tsx eval/agent-eval.ts",
     "eval:faults": "tsx eval/agent-eval.ts --faults-only",
     "eval:live": "tsx eval/run-eval.ts",
     "eval:retrieval": "tsx eval/retrieval-eval.ts",
     "eval:all": "npm run eval:agent && npm run eval:retrieval",
+    "eval:ci": "npm run eval:agent -- --no-write && npm run eval:retrieval -- --no-write",
     "smoke:anthropic": "tsx scripts/smoke-anthropic.ts",
-    "precommit": "node scripts/secret-scan.mjs"
+    "precommit": "npm run secret-scan:staged"
   },
   "dependencies": {
     "zod": "^3.23.8"

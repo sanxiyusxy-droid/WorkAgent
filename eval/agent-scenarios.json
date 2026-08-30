@@ -141,15 +141,29 @@
             }
           ]
         },
-        { "kind": "text", "text": "The edit sequence was revised." }
+        {
+          "kind": "tools",
+          "calls": [
+            {
+              "id": "verify_conflicts",
+              "name": "Shell",
+              "input": {
+                "command": "rg alpha a.txt",
+                "evidenceKind": "command",
+                "evidenceFiles": ["a.txt"]
+              }
+            }
+          ]
+        },
+        { "kind": "text", "text": "The edit sequence was revised and the unchanged file was verified." }
       ],
       "runtime": {
         "replan": { "failureThreshold": 99, "conflictThreshold": 3 }
       },
       "expect": {
         "terminal": ["completed"],
-        "maxModelRequests": 4,
-        "maxToolCalls": 6,
+        "maxModelRequests": 5,
+        "maxToolCalls": 7,
         "toolErrors": {
           "edit_1": "FILE_VERSION_CONFLICT",
           "edit_2": "FILE_VERSION_CONFLICT",
@@ -399,10 +413,10 @@
     },
     {
       "id": "recovery-snapshot",
-      "title": "V4 snapshot plus tail is equivalent to full replay",
+      "title": "V5 snapshot plus tail is equivalent to full replay",
       "category": "recovery",
       "driver": "recovery_snapshot",
-      "prompt": "Read and write enough state to create a V4 snapshot.",
+      "prompt": "Read, write, and verify enough state to create a V5 snapshot.",
       "files": { "a.txt": "alpha" },
       "turns": [
         {
@@ -417,7 +431,17 @@
         },
         {
           "kind": "tools",
-          "calls": [{ "id": "read_2", "name": "Read", "input": { "path": "b.txt" } }]
+          "calls": [
+            {
+              "id": "verify_1",
+              "name": "Shell",
+              "input": {
+                "command": "rg beta b.txt",
+                "evidenceKind": "command",
+                "evidenceFiles": ["b.txt"]
+              }
+            }
+          ]
         },
         {
           "kind": "tools",
@@ -463,7 +487,7 @@
     },
     {
       "id": "calibration-history-pin",
-      "title": "History calibration stays pinned across mutation and V4 recovery",
+      "title": "History calibration stays pinned across mutation and V5 recovery",
       "category": "adaptive-recovery",
       "driver": "calibration_resume",
       "calibrationCase": "history_pin",

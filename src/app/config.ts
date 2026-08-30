@@ -268,11 +268,49 @@ export interface AgentFileConfig {
   source?: string
 }
 
+/** One model bundle selected atomically from a single config file. */
+export interface ModelFileSelection {
+  model: ModelFileConfig
+  /** file that owns the whole provider/model/key/baseUrl bundle */
+  source?: string
+}
+
+const MODEL_CONFIG_KEYS = ['provider', 'baseUrl', 'apiKey', 'model'] as const
+
+/** True only when a config contains at least one recognized model field. */
+export function hasModelConfigFields(model: unknown): boolean {
+  if (model === null || typeof model !== 'object' || Array.isArray(model)) {
+    return false
+  }
+  return MODEL_CONFIG_KEYS.some(key => Object.prototype.hasOwnProperty.call(model, key))
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return false
+  }
+  const prototype = Object.getPrototypeOf(value)
+  return prototype === Object.prototype || prototype === null
+}
+
+function filesystemErrorCode(error: unknown): string {
+  if (
+    error !== null &&
+    typeof error === 'object' &&
+    'code' in error &&
+    typeof error.code === 'string'
+  ) {
+    return error.code
+  }
+  return 'UNKNOWN'
+}
+
 /**
  * Load the first existing config file from the candidate paths.
  * The file may contain:
  *   { "model": {...credentials}, "mode": ..., "maxTurns": ..., "debug": true, ... }
- * Unknown keys are ignored; a broken file falls back to empty config.
+ * Unknown keys are ignored; malformed JSON fails closed without echoing its
+ * potentially credential-bearing parser context.
  */
 export async function loadAgentConfigFile(
   candidates: string[],
@@ -281,27 +319,59 @@ export async function loadAgentConfigFile(
     let raw: string
     try {
       raw = await readFile(path, 'utf8')
-    } catch {
-      continue
-    }
-    try {
-      const parsed = JSON.parse(raw) as Record<string, unknown>
-      const { model, debug, sessionId, ...rest } = parsed
-      return {
-        layer: rest as ConfigLayer,
-        model: (model ?? {}) as ModelFileConfig,
-        debug: typeof debug === 'boolean' ? debug : undefined,
-        sessionId: typeof sessionId === 'string' ? sessionId : undefined,
-        source: path,
-      }
     } catch (error) {
+      const code = filesystemErrorCode(error)
+      if (code === 'ENOENT') continue
+      // Do not include the platform error message: paths are enough for
+      // diagnostics, while arbitrary lower-level context is not trusted.
+      throw new Error(`failed to read config file ${path}: ${code}`)
+    }
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(raw)
+    } catch {
       // a malformed config must be visible, not silently ignored
+      throw new Error(`failed to parse config file ${path}: invalid JSON`)
+    }
+    if (!isPlainObject(parsed)) {
+      throw new Error(`failed to parse config file ${path}: root must be a JSON object`)
+    }
+    const { model, debug, sessionId, ...rest } = parsed
+    if (
+      Object.prototype.hasOwnProperty.call(parsed, 'model') &&
+      !isPlainObject(model)
+    ) {
       throw new Error(
-        `failed to parse config file ${path}: ${(error as Error).message}`,
+        `failed to parse config file ${path}: model must be a JSON object`,
       )
+    }
+    return {
+      layer: rest as ConfigLayer,
+      model: (model ?? {}) as ModelFileConfig,
+      debug: typeof debug === 'boolean' ? debug : undefined,
+      sessionId: typeof sessionId === 'string' ? sessionId : undefined,
+      source: path,
     }
   }
   return { layer: {}, model: {} }
+}
+
+/**
+ * Select the first file that owns any model field. Empty/runtime-only files are
+ * skipped, but fields are never merged across files: a partial bundle blocks
+ * lower-priority bundles instead of inheriting their credential or endpoint.
+ */
+export async function loadModelConfigFile(
+  candidates: string[],
+): Promise<ModelFileSelection> {
+  for (const path of candidates) {
+    const loaded = await loadAgentConfigFile([path])
+    if (!loaded.source) continue
+    if (hasModelConfigFields(loaded.model)) {
+      return { model: loaded.model, source: loaded.source }
+    }
+  }
+  return { model: {} }
 }
 
 /** Directory holding the user-level config, overridable for tests. */
@@ -335,6 +405,27 @@ export function configCandidates(input: {
 }
 
 /**
+ * Model trust-source order differs deliberately from runtime configuration:
+ * an explicit file still wins, but user credentials outrank a workspace file.
+ * This lets project runtime settings coexist with setup-managed credentials
+ * without ever merging the user key into a project-controlled endpoint.
+ */
+export function modelConfigCandidates(input: {
+  workspaceRoot: string
+  explicit?: string
+  packageRoot?: string
+}): string[] {
+  const candidates = [
+    input.explicit,
+    process.env.AGENT_CONFIG,
+    userConfigPath(),
+    join(input.workspaceRoot, 'agent.config.json'),
+    input.packageRoot ? join(input.packageRoot, 'agent.config.json') : undefined,
+  ].filter((path): path is string => Boolean(path))
+  return [...new Set(candidates)]
+}
+
+/**
  * Persist credentials + preferences to the user-level config so the agent
  * works from any directory without environment variables.
  */
@@ -356,11 +447,17 @@ export async function saveUserConfig(data: {
 
   const merged = {
     ...existing,
-    model: { ...((existing.model as object) ?? {}), ...data.model },
+    // The connection is one trust bundle. Replacing it atomically prevents a
+    // provider switch (for example custom OpenAI -> native Anthropic) from
+    // retaining an old baseUrl or other route field.
+    model: { ...data.model },
     ...(data.mode ? { mode: data.mode } : {}),
     ...(data.debug !== undefined ? { debug: data.debug } : {}),
   }
-  await writeFile(path, `${JSON.stringify(merged, null, 2)}\n`, 'utf8')
+  await writeFile(path, `${JSON.stringify(merged, null, 2)}\n`, {
+    encoding: 'utf8',
+    mode: 0o600,
+  })
   // the file holds an API key: restrict permissions where the OS supports it
   try {
     await chmod(path, 0o600)

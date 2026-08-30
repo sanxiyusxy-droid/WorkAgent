@@ -43,13 +43,13 @@ jobs:
       - name: Tests (incl. recovery, escape, kill-point suites)
         run: npm test
 
-      - name: Secret scan
-        # must never skip: the script fails on findings and refuses to
-        # return green for non-git or empty checkouts
-        run: npm run secret-scan
-
       - name: Build (embeds source commit)
         run: npm run build
+
+      - name: Secret scan (tracked source and package output)
+        # CI must scan the clean checkout rather than its empty staged set.
+        # The scanner also fails closed if no eligible files are selected.
+        run: npm run secret-scan:package
 
       - name: Package content allowlist
         # fail the pipeline if the tarball would ship .agent sessions,
@@ -59,7 +59,9 @@ jobs:
       - name: Install from packed tarball
         shell: bash
         run: |
-          npm pack
+          # The workflow runs lifecycle gates explicitly in verify/offline-eval;
+          # avoid repeating tests/evaluations six more times via this hook.
+          npm pack --ignore-scripts
           TGZ=$(ls code-agent-*.tgz)
           mkdir ../install-check
           cd ../install-check
@@ -67,3 +69,33 @@ jobs:
           npm install "$GITHUB_WORKSPACE/$TGZ" --no-audit --no-fund
           node node_modules/code-agent/dist/agent.mjs --version
           node node_modules/code-agent/dist/agent.mjs --help >/dev/null
+
+  offline-eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - name: Release tag matches package version
+        run: npm run check:release-tag
+      - name: Standard npm pack lifecycle (includes offline release gates)
+        shell: bash
+        run: |
+          # Do not pass --ignore-scripts here: this single job must prove the
+          # real npm lifecycle executes prepack, including eval:ci --no-write.
+          npm pack
+          TGZ=$(ls code-agent-*.tgz)
+          test -f "$TGZ"
+          diff -u \
+            <(printf '%s\n' \
+              package/LICENSE \
+              package/README.md \
+              package/dist/agent \
+              package/dist/agent.cmd \
+              package/dist/agent.mjs \
+              package/package.json | sort) \
+            <(tar -tzf "$TGZ" | sort)
+          test ! -d eval/results

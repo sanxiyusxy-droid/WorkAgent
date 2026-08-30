@@ -11,7 +11,13 @@ describe('Edit tool', () => {
     const version = computeVersion(original)
     const world = await makeWorld({
       mode: 'acceptEdits',
-      files: { 'src/a.ts': original },
+      askHandler: async () => 'allow',
+      files: {
+        'src/a.ts': original,
+        'verify.test.js':
+          "const test=require('node:test');const assert=require('node:assert/strict');" +
+          "const fs=require('node:fs');test('edit',()=>assert.match(fs.readFileSync('src/a.ts','utf8'),/value = 2/));",
+      },
       turns: [
         toolCallTurn([
           {
@@ -25,6 +31,13 @@ describe('Edit tool', () => {
             },
           },
         ]),
+        toolCallTurn([{
+          id: 'verify_e1', name: 'Shell',
+          input: {
+            command: 'node --test verify.test.js', evidenceKind: 'test',
+            evidenceFiles: ['src/a.ts'],
+          },
+        }]),
         textTurn('edited'),
       ],
     })

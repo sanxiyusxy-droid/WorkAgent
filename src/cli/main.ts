@@ -15,10 +15,12 @@ import { createRuntime, resumeState, type AgentRuntime } from '../app/createRunt
 import {
   configCandidates,
   loadAgentConfigFile,
+  loadModelConfigFile,
   mergeConfig,
+  modelConfigCandidates,
   type AgentFileConfig,
   type EffectiveConfig,
-  type ModelFileConfig,
+  type ModelFileSelection,
 } from '../app/config.js'
 import type { AgentMode, FactEvent, TerminalReason } from '../core/events.js'
 import { reduce, type AgentState } from '../core/state.js'
@@ -43,6 +45,13 @@ import { commandMenuLines, commandNames, findCommand, parseCommand, type Command
 import { modeLabel, oneLine, rule, style, symbol } from './theme.js'
 import { helpText, parseArgs, type CliArgs } from './args.js'
 import { runSetupWizard } from './setupWizard.js'
+import { ConcealableTerminalOutput, questionSecret } from './secretPrompt.js'
+import {
+  ModelConfigurationError,
+  resolveMainModelConfig,
+  resolveVerifierModelConfig,
+  type ResolvedModelConfig,
+} from '../app/modelConfig.js'
 
 /** Walk up from this file until a package.json is found. */
 async function findPackageRoot(): Promise<string | undefined> {
@@ -78,41 +87,30 @@ function buildSuffix(): string {
     : ''
 }
 
-function buildModel(file: ModelFileConfig): ModelGateway | null {
-  const provider = process.env.AGENT_PROVIDER ?? file.provider ?? 'openai'
-  const apiKey = process.env.AGENT_API_KEY ?? file.apiKey
-  const model = process.env.AGENT_MODEL ?? file.model
-  const baseUrl = process.env.AGENT_BASE_URL ?? file.baseUrl
-
-  if (!apiKey || !model || apiKey === 'FILL_ME') return null
-
-  return provider === 'anthropic'
-    ? new AnthropicProvider({ apiKey, model, baseUrl })
+function buildModel(config: ResolvedModelConfig): ModelGateway {
+  return config.provider === 'anthropic'
+    ? new AnthropicProvider({
+        apiKey: config.apiKey,
+        model: config.model,
+        baseUrl: config.baseUrl,
+      })
     : new OpenAICompatibleProvider({
-        baseUrl: baseUrl ?? 'https://api.openai.com/v1',
-        apiKey,
-        model,
+        baseUrl: config.baseUrl ?? 'https://api.openai.com/v1',
+        apiKey: config.apiKey,
+        model: config.model,
       })
 }
 
 /**
  * Optional independent model for the verification subagent — reduces
  * same-source confirmation bias when the verifier runs on a different
- * provider/model than the implementer. Configure via AGENT_VERIFIER_PROVIDER
- * / AGENT_VERIFIER_MODEL (credentials are inherited from the main model).
+ * provider/model than the implementer. A model-only override reuses the exact
+ * main route; changing provider/baseUrl requires an isolated verifier key.
  * Returns null when no override is configured.
  */
-function buildVerifierModel(file: ModelFileConfig): ModelGateway | null {
-  const rawProvider = process.env.AGENT_VERIFIER_PROVIDER
-  const vProvider: 'openai' | 'anthropic' | undefined =
-    rawProvider === 'openai' || rawProvider === 'anthropic' ? rawProvider : undefined
-  const vModel = process.env.AGENT_VERIFIER_MODEL
-  if (!vProvider && !vModel) return null
-  return buildModel({
-    ...file,
-    provider: vProvider ?? file.provider,
-    model: vModel ?? file.model,
-  })
+function buildVerifierModel(main: ResolvedModelConfig): ModelGateway | null {
+  const verifier = resolveVerifierModelConfig(main)
+  return verifier ? buildModel(verifier) : null
 }
 
 /** Is this an empty folder we should treat as a greenfield project? */
@@ -256,13 +254,25 @@ async function main(): Promise<void> {
   }
 
   // ---- config ----
-  let fileConfig: AgentFileConfig = await loadAgentConfigFile(
-    configCandidates({ workspaceRoot, explicit: args.configPath, packageRoot }),
+  // Runtime settings retain first-file precedence. Model credentials/routes
+  // use a separate atomic selection so a runtime-only project file cannot
+  // shadow setup-managed user credentials (or contribute only an endpoint).
+  const candidateInput = {
+    workspaceRoot,
+    explicit: args.configPath,
+    packageRoot,
+  }
+  const fileConfig: AgentFileConfig = await loadAgentConfigFile(
+    configCandidates(candidateInput),
+  )
+  let modelConfig: ModelFileSelection = await loadModelConfigFile(
+    modelConfigCandidates(candidateInput),
   )
 
+  const terminalOutput = new ConcealableTerminalOutput(process.stdout)
   const rl = createInterface({
     input: process.stdin,
-    output: process.stdout,
+    output: terminalOutput,
     terminal: true,
     historySize: 200,
     completer: (line: string): [string[], string] => {
@@ -273,7 +283,22 @@ async function main(): Promise<void> {
   })
 
   // ---- setup wizard: explicit, or automatically when credentials are missing ----
-  let model = buildModel(fileConfig.model)
+  // Explicit setup must remain available even when the caller currently has
+  // a partial/invalid AGENT_* bundle that they intend to replace.
+  let resolvedModel =
+    args.command === 'setup'
+      ? null
+      : resolveMainModelConfig(modelConfig.model, process.env, modelConfig.source)
+  let model = resolvedModel ? buildModel(resolvedModel) : null
+  if (
+    resolvedModel?.source === 'environment' &&
+    Object.values(modelConfig.model).some(value => value !== undefined)
+  ) {
+    console.log(
+      `${style.yellow(symbol.warn)} AGENT_* model connection is active; ` +
+        'model fields from the selected config file are ignored to keep credentials and endpoints in one trust source.\n',
+    )
+  }
   if (args.command === 'setup' || !model) {
     if (!model && args.command !== 'setup') {
       console.log(
@@ -288,19 +313,38 @@ async function main(): Promise<void> {
       rl.close()
       process.exit(1)
     }
-    const result = await runSetupWizard(rl, fileConfig.model)
-    fileConfig = { ...fileConfig, model: result.model, source: result.savedTo }
-    model = buildModel(result.model)
+    const result = await runSetupWizard(
+      rl,
+      modelConfig.model,
+      prompt => questionSecret(rl, terminalOutput, prompt),
+    )
+    modelConfig = { model: result.model, source: result.savedTo }
     if (args.command === 'setup') {
       rl.close()
       return
     }
+    resolvedModel = resolveMainModelConfig(
+      modelConfig.model,
+      process.env,
+      modelConfig.source,
+    )
+    model = resolvedModel ? buildModel(resolvedModel) : null
   }
-  if (!model) {
+  if (!model || !resolvedModel) {
     console.error(`${symbol.fail} model configuration is still incomplete`)
     rl.close()
     process.exit(1)
   }
+
+  const modelConfigSource = resolvedModel.source === 'environment'
+    ? 'environment (atomic AGENT_* bundle)'
+    : modelConfig.source
+  const displayedConfigSource = fileConfig.source === modelConfigSource
+    ? fileConfig.source
+    : [
+        fileConfig.source ? `runtime ${fileConfig.source}` : undefined,
+        modelConfigSource ? `model ${modelConfigSource}` : undefined,
+      ].filter((value): value is string => Boolean(value)).join(' · ') || undefined
 
   const effective: EffectiveConfig = mergeConfig({
     project: fileConfig.layer,
@@ -368,7 +412,7 @@ async function main(): Promise<void> {
 
   const { runtime, loaded } = await createRuntime({
     model,
-    verifierModel: buildVerifierModel(fileConfig.model) ?? undefined,
+    verifierModel: buildVerifierModel(resolvedModel) ?? undefined,
     config: {
       workspaceRoot,
       mode: effective.mode,
@@ -509,7 +553,7 @@ async function main(): Promise<void> {
       provider: runtime.model.provider,
       modelId: runtime.model.modelId,
       mode: state.mode,
-      configSource: fileConfig.source,
+      configSource: displayedConfigSource,
       configHash: effective.configHash,
       resumed: resumedNote,
       greenfield: workspace.empty,
@@ -661,7 +705,7 @@ async function main(): Promise<void> {
     state,
     effective,
     metrics,
-    configSource: fileConfig.source,
+    configSource: displayedConfigSource,
     debug,
     print: text => renderer.plain(text),
     setState: next => {
@@ -745,6 +789,10 @@ async function main(): Promise<void> {
 }
 
 main().catch(error => {
-  console.error(error)
+  if (error instanceof ModelConfigurationError) {
+    console.error(`${symbol.fail} unsafe model configuration refused: ${error.message}`)
+  } else {
+    console.error(error)
+  }
   process.exit(1)
 })

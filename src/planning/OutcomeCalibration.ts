@@ -140,13 +140,13 @@ export async function loadOutcomeCalibrationScan(input: {
       if (!loaded.ok) continue
       if (loaded.envelopes.some(envelope => envelope.sessionId !== sessionId)) continue
       if (loaded.envelopes[0]?.event.type !== 'run.started') continue
-      // First validate the normal recovery path, including V4 snapshot/profile
+      // First validate the normal recovery path, including V5 snapshot/profile
       // consistency. Historical policy input then also receives a full reducer
       // replay so no malformed pre-snapshot sample can hide behind the fast
       // snapshot path.
       if (!diagnoseSession(loaded, input.workspaceRoot).ok) continue
       if (
-        loaded.lastSnapshot?.version === 4 &&
+        loaded.lastSnapshot?.version === 5 &&
         !diagnoseSession(
           { ...loaded, lastSnapshot: null },
           input.workspaceRoot,

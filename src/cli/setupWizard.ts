@@ -11,6 +11,8 @@ interface Preset {
   keyHint: string
 }
 
+export type SecretQuestion = (prompt: string) => Promise<string>
+
 /** Known OpenAI-compatible endpoints, plus Anthropic native. */
 const PRESETS: Preset[] = [
   {
@@ -69,7 +71,11 @@ const PRESETS: Preset[] = [
 export async function runSetupWizard(
   rl: ReadlineInterface,
   existing?: ModelFileConfig,
+  askSecret?: SecretQuestion,
 ): Promise<{ model: ModelFileConfig; savedTo: string }> {
+  if (!askSecret) {
+    throw new Error('setup requires a non-echoing API-key prompt')
+  }
   console.log(rule('setup'))
   console.log(
     style.gray(
@@ -126,10 +132,10 @@ export async function runSetupWizard(
   if (previousKey) {
     console.log(style.gray(`  press Enter to keep the existing key (${maskKey(previousKey)})`))
   }
-  let apiKey = (await rl.question('  API key: ')).trim()
+  let apiKey = (await askSecret('  API key: ')).trim()
   if (!apiKey && previousKey) apiKey = previousKey
   while (!apiKey) {
-    apiKey = (await rl.question('  API key (required): ')).trim()
+    apiKey = (await askSecret('  API key (required): ')).trim()
   }
 
   const model_: ModelFileConfig = {

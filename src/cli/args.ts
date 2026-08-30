@@ -199,9 +199,13 @@ OPTIONS
   -p, --print <prompt>   non-interactive single turn
       --debug            show prompt manifests, permission traces, transitions
 
-CONFIG PRECEDENCE
-  environment variables > --config > <workspace>/agent.config.json
-  > ~/.code-agent/config.json > installation directory
+RUNTIME CONFIG PRECEDENCE
+  CLI/environment overrides > --config/AGENT_CONFIG > workspace > user > install
+
+MODEL SOURCE PRECEDENCE
+  atomic AGENT_* bundle > --config/AGENT_CONFIG > user > workspace > install
+  runtime-only files are skipped; the first file with any model field owns the
+  complete bundle and incomplete bundles fail closed without cross-file merging
 
 IN-SESSION COMMANDS
   /help /mode /model /tasks /plan /evidence /metrics /session /compact

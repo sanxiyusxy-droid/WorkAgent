@@ -88,7 +88,7 @@ function humanTexts(state: { messages: { meta?: { source?: string }; content: { 
 }
 
 describe('recovery strictness (finish-list §1.5)', () => {
-  test('malformed V4 snapshot is diagnosed instead of escaping as an exception', async () => {
+  test('malformed V5 snapshot is diagnosed instead of escaping as an exception', async () => {
     const workspaceRoot = await mkdtemp(join(tmpdir(), 'agent-strict-'))
     try {
       const dir = join(workspaceRoot, '.agent', 'sessions', SESSION_ID)

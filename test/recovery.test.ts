@@ -351,6 +351,7 @@ describe('createSnapshot / restoreFromSnapshot roundtrip', () => {
       },
       workspace: {
         root: '/workspace',
+        revision: 0,
         touchedFiles: ['a.ts', 'b.ts'],
         planScopedTouchedFiles: ['b.ts'],
         createdFiles: ['c.ts'],

@@ -194,6 +194,18 @@ function buildShellTool(name: 'Shell' | 'ShellReadOnly') {
     concurrency: () => 'exclusive',
     interruptBehavior: () => 'cancel',
     resources: () => [{ resource: 'process:workspace', mode: 'write' }],
+    workspaceMutation: input => {
+      if (name === 'ShellReadOnly') return undefined
+      const analysis = analyzeShellCommand(input.command)
+      return analysis.classification === 'readonly'
+        ? undefined
+        : {
+            scope: 'workspace',
+            reason:
+              `Shell command is ${analysis.classification}; its exact workspace ` +
+              'write set cannot be proven before execution',
+          }
+    },
 
     permission: async input => {
       const analysis = analyzeShellCommand(input.command)
@@ -272,7 +284,10 @@ function buildShellTool(name: 'Shell' | 'ShellReadOnly') {
         let fileVersions: Record<string, string> | undefined
         if (input.evidenceFiles && input.evidenceFiles.length > 0) {
           const { checkPathReal } = await import('../../policy/pathPolicy.js')
-          const { readFileVersion } = await import('../../workspace/FileVersion.js')
+          const {
+            MISSING_FILE_VERSION,
+            readFileVersion,
+          } = await import('../../workspace/FileVersion.js')
           fileVersions = {}
           for (const rel of input.evidenceFiles) {
             const check = await checkPathReal(rel, ctx.workspaceRoot, { read: true })
@@ -280,8 +295,15 @@ function buildShellTool(name: 'Shell' | 'ShellReadOnly') {
             try {
               const { version } = await readFileVersion(check.resolved)
               fileVersions[check.resolved] = version
-            } catch {
-              // missing/unreadable file: nothing to bind
+            } catch (error) {
+              if (
+                error instanceof Error &&
+                'code' in error &&
+                (error as NodeJS.ErrnoException).code === 'ENOENT'
+              ) {
+                fileVersions[check.resolved] = MISSING_FILE_VERSION
+              }
+              // Other read errors remain unbound and therefore fail closed.
             }
           }
         }

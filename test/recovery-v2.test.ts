@@ -36,13 +36,18 @@ function normalize(state: AgentState): Record<string, unknown> {
   }
 }
 
-describe('StateSnapshotV4 recovery equivalence', () => {
+describe('StateSnapshotV5 recovery equivalence', () => {
   test('snapshot+tail recovery is field-for-field equal to full replay', async () => {
     const world1 = await makeWorld({
       persist: true,
       sessionId: 'eq-session',
       mode: 'bypassPermissions',
-      files: { 'a.txt': 'alpha' },
+      files: {
+        'a.txt': 'alpha',
+        'verify.test.js':
+          "const test=require('node:test');const assert=require('node:assert/strict');" +
+          "const fs=require('node:fs');test('b',()=>assert.equal(fs.readFileSync('b.txt','utf8'),'beta'));",
+      },
       turns: [
         toolCallTurn([{ id: 'c1', name: 'Read', input: { path: 'a.txt' } }]),
         toolCallTurn([{
@@ -50,7 +55,14 @@ describe('StateSnapshotV4 recovery equivalence', () => {
           name: 'Write',
           input: { path: 'b.txt', content: 'beta', overwrite: true },
         }]),
-        toolCallTurn([{ id: 'c3', name: 'Read', input: { path: 'b.txt' } }]),
+        toolCallTurn([{
+          id: 'c3', name: 'Shell',
+          input: {
+            command: 'node --test verify.test.js',
+            evidenceKind: 'test',
+            evidenceFiles: ['b.txt'],
+          },
+        }]),
         toolCallTurn([{ id: 'c4', name: 'Read', input: { path: 'a.txt' } }]),
         textTurn('done'),
       ],
@@ -64,12 +76,12 @@ describe('StateSnapshotV4 recovery equivalence', () => {
 
       const loaded = await loadSession(world1.runtime.journalPath)
       expect(loaded.ok).toBe(true)
-      // the run is long enough to have produced a V4 snapshot
-      expect(loaded.lastSnapshot?.version).toBe(4)
+      // the run is long enough to have produced a V5 snapshot
+      expect(loaded.lastSnapshot?.version).toBe(5)
       expect(loaded.tailEvents.length).toBeGreaterThan(0)
       expect(loaded.tailEvents.length).toBeLessThan(loaded.envelopes.length)
 
-      // Path A: V4 snapshot + tail replay
+      // Path A: V5 snapshot + tail replay
       const worldA = await makeWorld({
         persist: true,
         sessionId: 'eq-session',

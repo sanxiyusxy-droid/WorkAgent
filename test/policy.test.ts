@@ -44,6 +44,20 @@ async function decide(
   return engine.decide({ tool, input, callId: 'call_1', mode, context: makeCtx() })
 }
 
+function contradictoryReadOnlyTool(
+  resources: ToolDefinition<any, any>['resources'] = (input: { path: string }) => [
+    { resource: `file:${input.path}`, mode: 'write' as const },
+  ],
+): ToolDefinition<any, any> {
+  return {
+    ...ReadTool,
+    name: 'ThirdPartyContradictoryReadOnly',
+    resourcesExplicit: true,
+    readOnly: () => true,
+    resources,
+  }
+}
+
 describe('shell analysis', () => {
   test.each([
     ['git status', 'readonly'],
@@ -100,6 +114,94 @@ describe('permission matrix', () => {
     const engine = makeEngine()
     const decision = await decide(engine, ReadTool, { path: 'a.txt', offset: 0, limit: 10 }, 'default')
     expect(decision.behavior).toBe('allow')
+  })
+
+  test('default mode asks for an explicit file-write claim despite readOnly=true', async () => {
+    let askCount = 0
+    const engine = new PolicyEngine({
+      clock: fixedClock(),
+      ids: createSequentialIds(),
+      askHandler: async () => {
+        askCount += 1
+        return 'allow'
+      },
+    })
+    const decision = await decide(
+      engine,
+      contradictoryReadOnlyTool(),
+      { path: 'inside.txt', offset: 0, limit: 10 },
+      'default',
+    )
+    expect(decision.behavior).toBe('allow')
+    expect(askCount).toBe(1)
+    expect(decision.trace.some(step => step.stage === 'ask')).toBe(true)
+  })
+
+  test('an explicit workspace write claim also overrides readOnly=true', async () => {
+    const tool = contradictoryReadOnlyTool(() => [
+      { resource: 'workspace:*', mode: 'write' },
+    ])
+    const decision = await decide(
+      makeEngine(null),
+      tool,
+      { path: 'inside.txt', offset: 0, limit: 10 },
+      'default',
+    )
+    expect(decision.behavior).toBe('deny')
+    expect(decision.reason).toEqual({ type: 'default' })
+    expect(decision.trace.some(step => step.stage === 'ask')).toBe(true)
+  })
+
+  test.each(['dontAsk', 'plan'] as const)(
+    '%s rejects an explicit file-write claim despite readOnly=true',
+    async mode => {
+      const decision = await decide(
+        makeEngine('allow'),
+        contradictoryReadOnlyTool(),
+        { path: 'inside.txt', offset: 0, limit: 10 },
+        mode,
+      )
+      expect(decision.behavior).toBe('deny')
+      expect(decision.reason).toEqual({ type: 'mode', mode })
+      expect(decision.trace.some(step => step.stage === 'ask')).toBe(false)
+    },
+  )
+
+  test('contradictory readOnly claims still receive write-path hard safety', async () => {
+    const decision = await decide(
+      makeEngine('allow'),
+      contradictoryReadOnlyTool(),
+      { path: '../outside.txt', offset: 0, limit: 10 },
+      'bypassPermissions',
+    )
+    expect(decision.behavior).toBe('deny')
+    expect(decision.reason).toEqual({
+      type: 'hard_safety',
+      rule: 'write_path_outside_workspace',
+    })
+  })
+
+  test('resource inspection failures fail closed as non-readonly', async () => {
+    let askCount = 0
+    const engine = new PolicyEngine({
+      clock: fixedClock(),
+      ids: createSequentialIds(),
+      askHandler: async () => {
+        askCount += 1
+        return 'allow'
+      },
+    })
+    const tool = contradictoryReadOnlyTool(() => {
+      throw new Error('third-party resource inspection failed')
+    })
+    const decision = await decide(
+      engine,
+      tool,
+      { path: 'inside.txt', offset: 0, limit: 10 },
+      'default',
+    )
+    expect(decision.behavior).toBe('allow')
+    expect(askCount).toBe(1)
   })
 
   test('default mode: Edit requires ask; no handler -> deny', async () => {

@@ -95,7 +95,10 @@ function calibrationSelectionFromLoaded(
     selected = freezeOutcomeCalibrationSelection(envelope.event.selection)
     selectedSeq = envelope.seq
   }
-  if (loaded.lastSnapshot?.version === 4) {
+  if (
+    loaded.lastSnapshot?.version === 4 ||
+    loaded.lastSnapshot?.version === 5
+  ) {
     const snapshotSelection = loaded.lastSnapshot.outcomeCalibrationSelection
     const snapshotEnvelope = [...loaded.envelopes]
       .reverse()
@@ -112,7 +115,7 @@ function calibrationSelectionFromLoaded(
     ) {
       throw new InvariantError(
         'outcome_calibration_snapshot_mismatch',
-        'V4 snapshot calibration selection does not match the journal selection fact',
+        'V4/V5 snapshot calibration selection does not match the journal selection fact',
       )
     }
   }
@@ -424,6 +427,11 @@ export async function createRuntime(input: {
     services,
     artifactDir: sessionDir,
     writeLock: () => replanApprovalPending,
+    persistBeforeWorkspaceMutation: journal
+      ? async (fact, turnId) => {
+          await journal.append(fact, turnId, 'flush')
+        }
+      : undefined,
   })
   const scheduler = new ToolScheduler(registry)
 
@@ -642,9 +650,9 @@ export interface ResumeOptions {
 
 /**
  * Resume helper. Two deterministic recovery paths:
- * - V4 snapshot present: restore full entities, policy state and calibration provenance, then replay envelopes after
+ * - V5 snapshot present: restore full entities, policy state, calibration provenance and mutation obligations, then replay envelopes after
  *   snapshot.lastSeq through the reducer.
- * - No V4 snapshot (including legacy V1/V2/V3): FULL replay — every FactEvent goes through the reducer
+ * - No V5 snapshot (including legacy V1-V4): FULL replay — every FactEvent goes through the reducer
  *   (never just the loader's message list).
  * Orphan tool calls are closed with synthetic INTERRUPTED_DURING_PREVIOUS_RUN
  * results. Returns recovered state, recovery facts and any replay failure.
@@ -669,9 +677,9 @@ export async function resumeState(
   let replayFailure: ReplayFailure | null = null
   const snapshot = loaded.lastSnapshot
 
-  if (snapshot?.version === 4) {
-    // Phase 1a: V4 restores full entities, policy state and the pinned
-    // calibration selection; the tail replays through the reducer.
+  if (snapshot?.version === 5) {
+    // Phase 1a: V5 restores full entities, policy state, the pinned
+    // calibration selection and pending mutation obligations.
     // replays through the reducer.
     state = restoreFromSnapshot(state, snapshot)
     const tail =
@@ -682,7 +690,7 @@ export async function resumeState(
     state = replayed.state
     replayFailure = replayed.failure
   } else {
-    // Phase 1b: no V4 checkpoint -> full deterministic replay of every fact
+    // Phase 1b: no V5 checkpoint -> full deterministic replay of every fact
     const replayed = replayEnvelopes(state, loaded.envelopes, degraded)
     state = replayed.state
     replayFailure = replayed.failure
@@ -729,18 +737,13 @@ export async function resumeState(
     runtime.plans.restore(plan)
   }
 
-  // restore the workspace revision counter from the journal so freshness
-  // judgments after recovery match the pre-crash view (finish-list §1.6)
-  let workspaceRevision = 0
-  const changedPaths: string[] = []
-  for (const envelope of loaded.envelopes) {
-    const event = envelope.event as FactEvent
-    if (event.type === 'workspace.changed') {
-      workspaceRevision += 1
-      changedPaths.push(event.path)
-    }
-  }
-  runtime.evidence.setWorkspaceRevision(workspaceRevision, changedPaths)
+  // The successfully replayed reducer state is authoritative. This remains
+  // aligned when degraded recovery intentionally skips a corrupt tail, while
+  // a second raw-envelope scan could otherwise over-count rejected facts.
+  runtime.evidence.setWorkspaceRevision(state.workspace.revision, [
+    ...state.workspace.touchedFiles,
+    ...(state.workspace.pendingVerification?.changedPaths ?? []),
+  ])
 
   // Phase 3: close accepted orphans and repair the smaller crash window where
   // tool.call.completed was durable but its provider-facing result message

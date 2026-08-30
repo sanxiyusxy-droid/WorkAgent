@@ -124,6 +124,13 @@ describe('v1.1 loop intelligence', () => {
             id: 'task_repaired', expectedRevision: 3, status: 'completed',
           } },
         ]),
+        toolCallTurn([{
+          id: 'verify-attempted-path', name: 'ShellReadOnly',
+          input: {
+            command: 'rg value a.ts',
+            evidenceFiles: ['a.ts'],
+          },
+        }]),
         textTurn('done'),
       ],
     })

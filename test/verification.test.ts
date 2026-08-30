@@ -277,6 +277,191 @@ describe('validateReport', () => {
 })
 
 describe('completion gate E2E', () => {
+  test('unplanned workspace writes get one repair turn, then terminate unverified', async () => {
+    const world = await makeWorld({
+      mode: 'acceptEdits',
+      verification: { enabled: true, riskThreshold: 1 },
+      turns: [
+        toolCallTurn([{
+          id: 'write_unplanned', name: 'Write',
+          input: { path: 'out.txt', content: 'unverified' },
+        }]),
+        textTurn('done'),
+        textTurn('no validation is available'),
+      ],
+    })
+    try {
+      const result = await collectRun(
+        world.runtime.engine,
+        await stateWithUser(world, 'write out.txt'),
+      )
+      const injected = result.facts.filter(
+        fact =>
+          fact.type === 'user.message.accepted' &&
+          fact.message.meta?.source === 'engine',
+      )
+      expect(injected).toHaveLength(1)
+      if (injected[0]?.type === 'user.message.accepted') {
+        expect(injected[0].message.content).toEqual([
+          expect.objectContaining({
+            type: 'text',
+            text: expect.stringContaining('durable workspace verification obligation'),
+          }),
+        ])
+      }
+      expect(result.terminal).toMatchObject({
+        reason: 'completed_with_unverified_items',
+        items: [expect.stringContaining('durable workspace verification obligation')],
+      })
+      expect(result.facts).not.toContainEqual(expect.objectContaining({
+        type: 'verification.completed',
+      }))
+    } finally {
+      await world.cleanup()
+    }
+  })
+
+  test('fresh runtime evidence after an unplanned write permits completion', async () => {
+    const world = await makeWorld({
+      mode: 'acceptEdits',
+      askHandler: async () => 'allow',
+      files: {
+        'verify.test.js':
+          "const test=require('node:test');const assert=require('node:assert/strict');" +
+          "const fs=require('node:fs');test('output',()=>assert.equal(fs.readFileSync('out.txt','utf8'),'verified'));",
+      },
+      turns: [
+        toolCallTurn([{
+          id: 'write_then_check', name: 'Write',
+          input: { path: 'out.txt', content: 'verified' },
+        }]),
+        toolCallTurn([{
+          id: 'check_after_write', name: 'Shell',
+          input: {
+            command: 'node --test verify.test.js', evidenceKind: 'test',
+            evidenceFiles: ['out.txt'],
+          },
+        }]),
+        textTurn('validated and complete'),
+      ],
+    })
+    try {
+      const result = await collectRun(
+        world.runtime.engine,
+        await stateWithUser(world, 'write and validate out.txt'),
+      )
+      expect(result.facts).toContainEqual(expect.objectContaining({
+        type: 'evidence.recorded',
+        receipt: expect.objectContaining({
+          status: 'passed', kind: 'test', workspaceRevision: 2,
+        }),
+      }))
+      expect(result.terminal).toEqual({ reason: 'completed' })
+    } finally {
+      await world.cleanup()
+    }
+  })
+
+  test('an unrelated version command cannot verify an unplanned write', async () => {
+    const world = await makeWorld({
+      mode: 'acceptEdits',
+      verification: { enabled: true, riskThreshold: 1 },
+      turns: [
+        toolCallTurn([{
+          id: 'write_before_version', name: 'Write',
+          input: { path: 'out.txt', content: 'unverified' },
+        }]),
+        toolCallTurn([{
+          id: 'version_only', name: 'Shell',
+          input: { command: 'node --version', evidenceKind: 'test' },
+        }]),
+        textTurn('done'),
+        textTurn('still done'),
+      ],
+    })
+    try {
+      const result = await collectRun(
+        world.runtime.engine,
+        await stateWithUser(world, 'write out.txt'),
+      )
+      expect(result.terminal).toMatchObject({
+        reason: 'completed_with_unverified_items',
+        items: [expect.stringContaining('durable workspace verification obligation')],
+      })
+      expect(result.facts).not.toContainEqual(expect.objectContaining({
+        type: 'verification.completed',
+      }))
+    } finally {
+      await world.cleanup()
+    }
+  })
+
+  test('a pending reflection cannot turn completion reflection into a no-op loop', async () => {
+    const world = await makeWorld({
+      turns: [textTurn('answer complete')],
+      intelligence: { completionReflection: true },
+    })
+    try {
+      const state = await stateWithUser(world, 'answer this question')
+      state.reflections = [{
+        id: 'reflection_pending', trigger: 'periodic', createdAt: 't',
+        summary: 'waiting for a bounded evaluation window', assumptions: [],
+        progress: {
+          completedTasks: 0, totalTasks: 0, touchedFiles: 0, toolCalls: 0,
+          evidenceReceipts: 0, successfulToolCalls: 0,
+        },
+        evidenceGaps: [], recommendation: 'continue',
+        decision: {
+          action: 'continue_step', rationale: 'observe more work',
+          successSignals: ['progress'], evaluateAfterToolCalls: 3,
+        },
+      }]
+      const result = await collectRun(world.runtime.engine, state)
+      expect(result.terminal).toEqual({ reason: 'completed' })
+      expect(world.model.requests).toHaveLength(1)
+      expect(result.facts).not.toContainEqual(expect.objectContaining({
+        type: 'loop.transitioned',
+        transition: expect.objectContaining({ reason: 'reflection_requested' }),
+      }))
+    } finally {
+      await world.cleanup()
+    }
+  })
+
+  test('completion reflection is detected when the bounded history is already full', async () => {
+    const world = await makeWorld({
+      turns: [textTurn('first answer'), textTurn('answer after reflection')],
+      intelligence: { completionReflection: true },
+    })
+    try {
+      const state = await stateWithUser(world, 'answer with one final reflection')
+      state.reflections = Array.from({ length: 20 }, (_, index) => ({
+        id: `old_reflection_${index}`, trigger: 'periodic' as const, createdAt: 't',
+        summary: 'historical display-only reflection', assumptions: [],
+        progress: {
+          completedTasks: 0, totalTasks: 0, touchedFiles: 0, toolCalls: 0,
+          evidenceReceipts: 0, successfulToolCalls: 0,
+        },
+        evidenceGaps: [], recommendation: 'continue',
+      }))
+      const result = await collectRun(world.runtime.engine, state)
+      const completionReflection = result.facts.find(
+        fact =>
+          fact.type === 'reflection.recorded' &&
+          fact.reflection.trigger === 'completion',
+      )
+      expect(completionReflection).toBeDefined()
+      expect(result.facts).toContainEqual(expect.objectContaining({
+        type: 'loop.transitioned',
+        transition: { reason: 'reflection_requested', trigger: 'completion' },
+      }))
+      expect(world.model.requests).toHaveLength(2)
+      expect(result.terminal).toEqual({ reason: 'completed' })
+    } finally {
+      await world.cleanup()
+    }
+  })
+
   test('open task blocks completion once, then honest termination', async () => {
     const world = await makeWorld({
       turns: [
@@ -436,12 +621,25 @@ describe('verification E2E', () => {
   test('verifier FAIL repairs once, then escalates to the replan protocol', async () => {
     const world = await makeWorld({
       mode: 'acceptEdits',
+      askHandler: async () => 'allow',
+      files: {
+        'verify.test.js':
+          "const test=require('node:test');const assert=require('node:assert/strict');" +
+          "const fs=require('node:fs');test('output',()=>assert.match(fs.readFileSync('out.txt','utf8'),/^v[12]$/));",
+      },
       verification: { enabled: true, riskThreshold: 1, maxRepairAttempts: 1 },
       turns: [
         // main agent: one write -> risk >= 1
         toolCallTurn([
           { id: 'w1', name: 'Write', input: { path: 'out.txt', content: 'v1' } },
         ]),
+        toolCallTurn([{
+          id: 'e1', name: 'Shell',
+          input: {
+            command: 'node --test verify.test.js', evidenceKind: 'test',
+            evidenceFiles: ['out.txt'],
+          },
+        }]),
         textTurn('done'), // -> gate complete -> verifier round 1
         textTurn(failReportJson), // verifier report: FAIL
         textTurn('fixed the finding'), // main agent repair answer -> verifier round 2
@@ -520,6 +718,12 @@ describe('verification E2E', () => {
     })
     const world = await makeWorld({
       mode: 'acceptEdits',
+      askHandler: async () => 'allow',
+      files: {
+        'verify.test.js':
+          "const test=require('node:test');const assert=require('node:assert/strict');" +
+          "const fs=require('node:fs');test('output',()=>assert.match(fs.readFileSync('out.txt','utf8'),/^v[12]$/));",
+      },
       verification: { enabled: true, riskThreshold: 1, maxRepairAttempts: 1 },
       channels: { requestPlanApproval: async () => true },
       turns: [
@@ -560,6 +764,13 @@ describe('verification E2E', () => {
           input: { path: 'out.txt', content: 'v1' },
         }]),
         toolCallTurn([{
+          id: 'initial_evidence', name: 'Shell',
+          input: {
+            command: 'node --test verify.test.js', evidenceKind: 'test',
+            evidenceFiles: ['out.txt'],
+          },
+        }]),
+        toolCallTurn([{
           id: 'complete_task',
           name: 'TaskUpdate',
           input: { id: 'task_1', expectedRevision: 2, status: 'completed' },
@@ -570,6 +781,13 @@ describe('verification E2E', () => {
           id: 'repair_write',
           name: 'Write',
           input: { path: 'out.txt', content: 'v2', overwrite: true },
+        }]),
+        toolCallTurn([{
+          id: 'repair_evidence', name: 'Shell',
+          input: {
+            command: 'node --test verify.test.js', evidenceKind: 'test',
+            evidenceFiles: ['out.txt'],
+          },
         }]),
         textTurn('repair complete; verify again'),
         textTurn(partialReport),
@@ -672,11 +890,24 @@ describe('verification E2E', () => {
     })
     const world = await makeWorld({
       mode: 'acceptEdits',
+      askHandler: async () => 'allow',
+      files: {
+        'verify.test.js':
+          "const test=require('node:test');const assert=require('node:assert/strict');" +
+          "const fs=require('node:fs');test('output',()=>assert.match(fs.readFileSync('out.txt','utf8'),/^v1$/));",
+      },
       verification: { enabled: true, riskThreshold: 1, maxRepairAttempts: 0 },
       turns: [
         toolCallTurn([
           { id: 'w1', name: 'Write', input: { path: 'out.txt', content: 'v1' } },
         ]),
+        toolCallTurn([{
+          id: 'e1', name: 'Shell',
+          input: {
+            command: 'node --test verify.test.js', evidenceKind: 'test',
+            evidenceFiles: ['out.txt'],
+          },
+        }]),
         textTurn('done'),
         textTurn(bogusPass), // fabricated evidence -> rejected
         textTurn(bogusPass), // second strike -> PARTIAL fallback

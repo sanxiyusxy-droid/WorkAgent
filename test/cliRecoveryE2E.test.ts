@@ -19,11 +19,15 @@ const tsxCli = require2.resolve('tsx/cli')
 const mainPath = join(repoRoot, 'src', 'cli', 'main.ts')
 const SESSION_ID = 'ses-corrupt'
 
-function runCli(args: string[], workspace: string) {
+function runCli(
+  args: string[],
+  workspace: string,
+  environment?: NodeJS.ProcessEnv,
+) {
   const options: SpawnSyncOptionsWithStringEncoding = {
     cwd: repoRoot,
     encoding: 'utf8',
-    env: {
+    env: environment ?? {
       ...process.env,
       AGENT_API_KEY: 'fake-e2e-key',
       AGENT_MODEL: 'fake-e2e-model',
@@ -87,6 +91,58 @@ async function seedCorruptSession(workspace: string): Promise<string> {
 }
 
 describe('CLI recovery E2E: strict by default, explicit degraded opt-in', () => {
+  test('runtime-only workspace config does not shadow the user model bundle', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'agent-e2e-model-source-'))
+    const configHome = await mkdtemp(join(tmpdir(), 'agent-e2e-model-home-'))
+    try {
+      await writeFile(
+        join(workspace, 'agent.config.json'),
+        JSON.stringify({ mode: 'plan', retrieval: { enabled: false } }),
+        'utf8',
+      )
+      await writeFile(
+        join(configHome, 'config.json'),
+        JSON.stringify({
+          model: {
+            provider: 'openai',
+            apiKey: 'fake-user-key',
+            model: 'fake-user-model',
+            baseUrl: 'http://127.0.0.1:9',
+          },
+        }),
+        'utf8',
+      )
+      await seedCorruptSession(workspace)
+
+      const environment: NodeJS.ProcessEnv = {
+        ...process.env,
+        CODE_AGENT_HOME: configHome,
+      }
+      for (const key of [
+        'AGENT_CONFIG',
+        'AGENT_API_KEY',
+        'AGENT_MODEL',
+        'AGENT_PROVIDER',
+        'AGENT_BASE_URL',
+      ]) {
+        delete environment[key]
+      }
+      const result = runCli(
+        ['-C', workspace, '--session', SESSION_ID, '-p', 'hi'],
+        workspace,
+        environment,
+      )
+
+      // Exit 2 proves model setup succeeded and execution reached the strict
+      // recovery preflight; a shadowed user bundle exits 1 before this point.
+      expect(result.status).toBe(2)
+      expect(result.stdout + result.stderr).not.toContain('no model configured')
+    } finally {
+      await rm(workspace, { recursive: true, force: true })
+      await rm(configHome, { recursive: true, force: true })
+    }
+  }, 120_000)
+
   test('default: refuses with exit 2, full diagnosis, journal untouched', async () => {
     const workspace = await mkdtemp(join(tmpdir(), 'agent-e2e-strict-'))
     try {

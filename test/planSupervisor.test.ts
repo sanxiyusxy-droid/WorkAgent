@@ -383,7 +383,7 @@ describe('v1.4 plan supervision and reflection feedback', () => {
     })
   })
 
-  test('persists tasks, plan health and reflection outcomes through V4 snapshots', () => {
+  test('persists tasks, plan health and reflection outcomes through V5 snapshots', () => {
     let state = baseState()
     state.tasks = [task({ id: 'task_1', stepId: 'step_1' })]
     const assessment = assessPlanHealth({

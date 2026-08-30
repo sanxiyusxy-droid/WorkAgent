@@ -62,6 +62,10 @@ export const ApplyPatchTool = defineTool<
   concurrency: () => 'exclusive',
   interruptBehavior: () => 'block',
   resources: () => [{ resource: 'workspace:*', mode: 'write' }],
+  workspaceMutation: input => ({
+    scope: 'paths',
+    paths: [...input.edits, ...input.creates].map(target => target.path),
+  }),
   permission: async () => ({ behavior: 'ask' }),
 
   validate: async (input, ctx) => {

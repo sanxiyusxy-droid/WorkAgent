@@ -5,7 +5,7 @@ import { isAbsolute, relative, resolve } from 'node:path'
 import { CODE_BINDING_KINDS, type EvidenceKind, type EvidenceReceipt } from './types.js'
 import type { Clock, IdGenerator } from '../core/runtimePrimitives.js'
 import { redactDeep } from '../security/secrets.js'
-import { readFileVersion } from '../workspace/FileVersion.js'
+import { MISSING_FILE_VERSION, readFileVersion } from '../workspace/FileVersion.js'
 
 /**
  * Evidence receipts are issued by the runtime, never by model text.
@@ -18,10 +18,9 @@ import { readFileVersion } from '../workspace/FileVersion.js'
 export class EvidenceStore {
   private readonly receipts = new Map<string, EvidenceReceipt>()
   /**
-   * Workspace revision: the number of workspace.changed facts observed so
-   * far. Bumped by the tool runtime when a write tool changes the workspace
-   * and restored from the journal during recovery, so receipts signed before
-   * a change can be detected as stale (finish-list §1.6).
+   * Workspace revision: the number of durable workspace-side-effect attempts
+   * observed so far. It advances before execution, so a crash or unknown
+   * outcome also invalidates older receipts.
    */
   private revision = 0
   private readonly changedPaths = new Set<string>()
@@ -46,14 +45,17 @@ export class EvidenceStore {
     return this.deps.workspaceRoot
   }
 
-  /** A write tool changed the workspace: every unbound receipt ages. */
-  bumpWorkspaceRevision(path?: string): number {
-    const resolved = path ? this.resolveWorkspacePath(path) : undefined
-    if (resolved) this.changedPaths.add(resolved)
+  /** A workspace mutation may start: every unbound receipt ages. */
+  bumpWorkspaceRevision(path?: string | readonly string[]): number {
+    const paths = Array.isArray(path) ? path : path ? [path] : []
+    for (const candidate of paths) {
+      const resolved = this.resolveWorkspacePath(candidate)
+      if (resolved) this.changedPaths.add(resolved)
+    }
     return ++this.revision
   }
 
-  /** Restore the counter from journal replay (count of workspace.changed). */
+  /** Restore the counter from journal replay (mutation starts + legacy changes). */
   setWorkspaceRevision(revision: number, paths: string[] = []): void {
     this.revision = revision
     this.changedPaths.clear()
@@ -163,13 +165,22 @@ export class EvidenceStore {
     for (const path of this.changedPaths) {
       try {
         versions[path] = (await readFileVersion(path)).version
-      } catch {
-        // Deleted or unreadable files remain covered by the workspace-revision
-        // fallback because an empty binding is not emitted.
+      } catch (error) {
+        if (isMissing(error)) {
+          versions[path] = MISSING_FILE_VERSION
+        }
+        // Other read errors remain fail-closed: do not claim a binding that
+        // the runtime could not actually observe.
       }
     }
     return versions
   }
+}
+
+function isMissing(error: unknown): boolean {
+  return error instanceof Error &&
+    'code' in error &&
+    (error as NodeJS.ErrnoException).code === 'ENOENT'
 }
 
 /**

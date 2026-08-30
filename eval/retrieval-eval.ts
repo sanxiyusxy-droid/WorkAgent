@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { performance } from 'node:perf_hooks'
+import { fileURLToPath } from 'node:url'
 import { CodeRetriever } from '../src/retrieval/CodeRetriever.js'
 import { computeVersion } from '../src/workspace/FileVersion.js'
 import type { ContextRelation, RetrievalHit } from '../src/retrieval/types.js'
@@ -28,6 +29,45 @@ interface ContextGraphCase {
   relations: ContextRelation[]
 }
 
+export interface RetrievalEvalFlags {
+  noWrite: boolean
+  help: boolean
+}
+
+export function parseRetrievalEvalFlags(argv: string[]): RetrievalEvalFlags {
+  const flags: RetrievalEvalFlags = { noWrite: false, help: false }
+  for (const arg of argv) {
+    if (arg === '--no-write') {
+      flags.noWrite = true
+    } else if (arg === '--help' || arg === '-h') {
+      flags.help = true
+    } else {
+      throw new Error(`unknown option: ${arg}`)
+    }
+  }
+  return flags
+}
+
+function usage(): string {
+  return [
+    'Deterministic offline retrieval evaluation',
+    '',
+    'Usage: npx tsx eval/retrieval-eval.ts [options]',
+    '',
+    '  --no-write  assert stdout-only evaluation (accepted for CI parity)',
+    '  --help      show this help',
+    '',
+    'This evaluator never writes result artifacts or a persistent retrieval cache.',
+  ].join('\n')
+}
+
+async function main(): Promise<void> {
+const flags = parseRetrievalEvalFlags(process.argv.slice(2))
+if (flags.help) {
+  process.stdout.write(`${usage()}\n`)
+  return
+}
+
 const workspaceRoot = process.cwd()
 const cases = JSON.parse(
   await readFile(join(workspaceRoot, 'eval', 'retrieval-cases.json'), 'utf8'),
@@ -38,8 +78,12 @@ const baseline = JSON.parse(
 const graphCases = JSON.parse(
   await readFile(join(workspaceRoot, 'eval', 'context-graph-cases.json'), 'utf8'),
 ) as ContextGraphCase[]
+const persistence = false
+if (flags.noWrite && persistence) {
+  throw new Error('--no-write requires retrieval persistence to be disabled')
+}
 const retriever = new CodeRetriever(workspaceRoot, {
-  persistence: false,
+  persistence,
   refreshOnSearch: false,
 })
 const refresh = await retriever.refresh()
@@ -171,3 +215,12 @@ process.stdout.write(JSON.stringify({
   graphResults,
 }, null, 2) + '\n')
 if (failures.length > 0) process.exitCode = 1
+}
+
+const invokedPath = process.argv[1]
+if (invokedPath && resolve(invokedPath) === fileURLToPath(import.meta.url)) {
+  main().catch(error => {
+    process.stderr.write(`[retrieval-eval] ${(error as Error).message}\n`)
+    process.exitCode = 1
+  })
+}

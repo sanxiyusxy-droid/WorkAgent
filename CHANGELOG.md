@@ -4,6 +4,86 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.8.2] - 2026-08-29
+
+### Security boundaries
+- Resolved model credentials, provider, model and endpoint as an atomic trust
+  bundle owned by exactly one trust source. Environment credentials can no
+  longer inherit a project-controlled route, file fields are never merged
+  across sources, and incomplete environment or file bundles fail closed with
+  a targeted diagnostic.
+- Added isolated verifier credentials and endpoints. A verifier may reuse the
+  main route only for a model-only override; changing its provider or base URL
+  requires `AGENT_VERIFIER_API_KEY`.
+- Replaced the setup API-key question with a non-echoing terminal prompt and
+  restored readline history after entry. Setup atomically replaces the complete
+  user-level model section, so a previous endpoint cannot survive beside a new
+  key, and configuration parse errors no longer echo credential-adjacent JSON
+  parser context.
+- Documented the credential-source rules and user/workspace storage boundary.
+- Applied symlink/junction-aware realpath containment in both the
+  `RefreshCodeIndex` tool and the retriever service, closing explicit refresh
+  reads outside the workspace.
+
+### Completion semantics
+- Added the durable `workspace.mutation.started` fact. `ToolRuntime` flushes it
+  synchronously before the external side effect starts, advances the workspace
+  revision at attempt time and opens a verification obligation independently
+  of model messages or the presence of a plan.
+- The obligation covers declared `Write`, `Edit`, `ApplyPatch` and Shell
+  mutations, plus custom tools with workspace-write resource claims. It
+  remains open across postcondition failure, partial-write exceptions,
+  compaction, interrupted execution, recovery and every abnormal terminal;
+  unknown effects fail closed instead of being treated as unchanged.
+- Clean completion now requires signed, passed runtime evidence bound to the
+  same session, run, workspace root and current revision. Known changed paths
+  may be covered by multiple current receipts; an unknown Shell write set
+  requires workspace-wide validation. Risk-based independent verification is
+  an additional layer, not a substitute for this relevant evidence.
+- Validation is recognized from the observed assertion or test/build/lint/
+  typecheck command rather than a model-declared evidence kind. Version/help,
+  dry-run/no-test skip flags, compound Shell syntax and arbitrary successful
+  no-op commands are rejected; `rg`/`grep` assertions must name the exact bound
+  paths they claim to cover.
+- Added V5 snapshots for the workspace revision and pending obligation. Only
+  V5 uses snapshot-plus-tail fast recovery; V1-V4 checkpoints use full replay.
+  A normal `completed` or `completed_with_unverified_items` terminal closes the
+  request boundary so the next unrelated task starts clean, while abnormal
+  stops retain the obligation for continuation.
+- Fixed completion-reflection single-flight handling so an older pending
+  reflection cannot cause a no-op turn loop, including when the bounded
+  reflection history is already full.
+
+### Automated release gates
+- Staged secret scanning now reads each exact Git index blob, including rename
+  and type-change candidates, instead of trusting a potentially different
+  working-tree copy. Git selection, blob reads, directory traversal and
+  realpath containment failures block the gate; only a confirmed non-Git tree
+  may fall back to a complete filesystem walk.
+- Every selected candidate is read as a Buffer, regardless of extension or
+  filename case, and only NUL-containing binary content is skipped. Whole-file
+  exemptions are empty, so extensionless files, `LICENSE`, `.env.local`,
+  uppercase names and built launchers receive the same scan. Empty or wholly
+  unreadable selections fail closed, except the explicit staged pre-commit
+  `--allow-empty` path; diagnostics never print the credential value.
+- Added distinct staged, all-tracked and package-output scan scripts. CI and
+  `prepack` now build before scanning every tracked candidate plus `dist/`, so
+  a clean checkout can no longer return green by scanning an empty index.
+- Added release-gate regressions for index-vs-working-tree content, rename and
+  type-change handling, extensionless and generated files, suffix-bypass
+  attempts, unreadable/escaping paths, empty selections and Git failures.
+- Added strict `--no-write`/help parsing to retrieval evaluation, with unknown
+  arguments rejected instead of ignored. `eval:ci` runs both deterministic
+  Agent and retrieval baselines offline without creating result artifacts.
+- Added a release-tag gate that requires `vX.Y.Z` to equal the package version
+  on tag builds. A dedicated Ubuntu Node 22 job performs a standard `npm pack`
+  without `--ignore-scripts`, proving that the real `prepack` lifecycle runs
+  the offline evaluations, build, secret scan and package allowlist. Matrix
+  install checks use `--ignore-scripts` only to avoid six redundant lifecycle
+  executions.
+- Credentialed Anthropic live smoke remains deferred because no API key is
+  available; protocol and offline gates remain in place.
+
 ## [1.8.1] - 2026-08-23
 
 ### Fixed

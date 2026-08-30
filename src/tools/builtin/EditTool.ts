@@ -44,6 +44,7 @@ export const EditTool = defineTool<z.infer<typeof EditInput>, EditOutput>({
   resources: (input, ctx) => [
     { resource: `file:${checkPath(input.path, ctx.workspaceRoot).resolved}`, mode: 'write' },
   ],
+  workspaceMutation: input => ({ scope: 'paths', paths: [input.path] }),
   permission: async () => ({ behavior: 'ask' }),
 
   validate: async (input, ctx) => {

@@ -91,7 +91,7 @@ export function diagnoseSession(
   }
 
   // dry replay with a throwaway state — identical path selection to
-  // resumeState (V4 snapshot tail vs legacy/full replay)
+  // resumeState (V5 snapshot tail vs legacy/full replay)
   let state = createInitialState({
     sessionId: 'diagnosis',
     runId: 'diagnosis',
@@ -103,7 +103,7 @@ export function diagnoseSession(
   const snapshot = loaded.lastSnapshot
   let tail = loaded.envelopes
   let lastTrustedSeq = 0
-  if (snapshot?.version === 4) {
+  if (snapshot?.version === 5) {
     let snapshotIndex = -1
     for (let index = loaded.envelopes.length - 1; index >= 0; index--) {
       if (loaded.envelopes[index]!.event.type === 'state.snapshot') {
@@ -147,7 +147,7 @@ export function diagnoseSession(
           ? `seq ${envelope.seq} / ${envelope.eventId}`
           : 'state.snapshot',
         message:
-          'V4 snapshot calibration selection does not match the unique journal selection fact',
+          'V5 snapshot calibration selection does not match the unique journal selection fact',
       })
       lastTrustedSeq = snapshotIndex > 0
         ? loaded.envelopes[snapshotIndex - 1]!.seq

@@ -66,7 +66,7 @@ export function detectSecrets(text: string): Array<{ label: string; index: numbe
 
 /**
  * Mask an API key for safe display: show first 4 and last 4 characters.
- * "sk-5941759fcd5f47c880e774f1bdf5d32e" -> "sk-5...d32e"
+ * A key-shaped value is abbreviated to a short prefix and suffix.
  */
 export function maskKey(key: string): string {
   if (key.length <= 12) return `${key.slice(0, 3)}***`

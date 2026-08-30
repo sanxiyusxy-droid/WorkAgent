@@ -79,9 +79,10 @@ export class PolicyEngine {
 
   async decide(request: PolicyRequest): Promise<PermissionDecision> {
     const trace: DecisionTraceStep[] = []
+    const effectiveReadOnly = this.isEffectivelyReadOnly(request)
 
     // 1. hard safety — cannot be bypassed by any mode
-    const hard = this.hardSafetyCheck(request)
+    const hard = this.hardSafetyCheck(request, effectiveReadOnly)
     trace.push({ stage: 'hard_safety', detail: hard ? hard.rule : 'pass' })
     if (hard) {
       return this.finish(request, 'deny', { type: 'hard_safety', rule: hard.rule }, trace)
@@ -123,7 +124,7 @@ export class PolicyEngine {
       toolWantsAsk && own.code !== undefined && UNBYPASSABLE_ASK_CODES.has(own.code)
 
     // 5. mode policy
-    const mode = this.applyMode(request, toolWantsAsk)
+    const mode = this.applyMode(request, toolWantsAsk, effectiveReadOnly)
     trace.push({ stage: 'mode', detail: `${request.mode}:${mode ?? 'no decision'}` })
     if (mode === 'allow') {
       return this.finish(request, 'allow', { type: 'mode', mode: request.mode }, trace)
@@ -154,12 +155,38 @@ export class PolicyEngine {
 
   // --- internals ---
 
-  private hardSafetyCheck(request: PolicyRequest): { rule: string } | null {
+  /**
+   * Treat readOnly as a claim that must agree with explicit workspace resource
+   * locks. Third-party tools cannot opt out of write policy by declaring
+   * readOnly=true while also claiming a file/workspace write. Resource
+   * inspection failures fail closed. `process:workspace` remains only a
+   * scheduling lock because ShellReadOnly legitimately uses it.
+   */
+  private isEffectivelyReadOnly(request: PolicyRequest): boolean {
+    try {
+      if (request.tool.readOnly(request.input) !== true) return false
+      const claims = request.tool.resources(request.input, request.context)
+      const hasExplicitWorkspaceWrite =
+        request.tool.resourcesExplicit === true &&
+        claims.some(claim =>
+          claim.mode === 'write' &&
+          (claim.resource === 'workspace:*' || claim.resource.startsWith('file:')),
+        )
+      return !hasExplicitWorkspaceWrite
+    } catch {
+      return false
+    }
+  }
+
+  private hardSafetyCheck(
+    request: PolicyRequest,
+    effectiveReadOnly: boolean,
+  ): { rule: string } | null {
     const input = request.input as Record<string, unknown> | null
 
     // Writing tools must stay inside the workspace and away from
     // sensitive paths — regardless of mode.
-    const isWrite = !request.tool.readOnly(request.input)
+    const isWrite = !effectiveReadOnly
     const path = typeof input?.path === 'string' ? input.path : undefined
     if (isWrite && path) {
       const check = checkPath(path, request.context.workspaceRoot)
@@ -239,9 +266,10 @@ export class PolicyEngine {
   private applyMode(
     request: PolicyRequest,
     toolWantsAsk: boolean,
+    effectiveReadOnly: boolean,
   ): PermissionBehavior | null {
-    const { mode, tool, input } = request
-    const readOnly = tool.readOnly(input)
+    const { mode, tool } = request
+    const readOnly = effectiveReadOnly
 
     switch (mode) {
       case 'default':

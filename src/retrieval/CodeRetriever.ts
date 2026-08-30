@@ -12,6 +12,7 @@ import {
 } from 'node:fs/promises'
 import { dirname, extname, join, relative, resolve, sep } from 'node:path'
 import { promisify } from 'node:util'
+import { checkPathReal } from '../policy/pathPolicy.js'
 import { detectSecrets, sanitize } from '../security/secrets.js'
 import { computeVersion } from '../workspace/FileVersion.js'
 import { LocalHashEmbeddingProvider, tokenize } from './LocalHashEmbedding.js'
@@ -420,6 +421,15 @@ export class CodeRetriever implements Retriever {
     forceAll = false,
   ): Promise<RefreshResult> {
     const started = this.now()
+    // The public service can be called without going through the tool runtime.
+    // Re-check explicit paths immediately before discovery so symlinks and
+    // Windows junctions cannot escape the workspace boundary.
+    for (const path of paths ?? []) {
+      const check = await checkPathReal(path, this.workspaceRoot, { read: true })
+      if (!check.ok) {
+        throw new Error(`refresh path rejected: ${check.reason ?? 'invalid_path'}`)
+      }
+    }
     await this.loadCache()
     if (signal?.aborted) throw abortError()
     const full = !paths || paths.length === 0

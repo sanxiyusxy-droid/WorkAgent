@@ -5,7 +5,7 @@ import type {
   RetrievalHit,
   RetrievalTrace,
 } from '../../retrieval/types.js'
-import { checkReadPath } from '../../policy/pathPolicy.js'
+import { checkPathReal, checkReadPath } from '../../policy/pathPolicy.js'
 import { defineTool, type ToolContext } from '../Tool.js'
 
 const RetrievalKindSchema = z.enum(['code', 'documentation', 'configuration'])
@@ -239,7 +239,10 @@ export const RefreshCodeIndexTool = defineTool({
   resources: () => [{ resource: 'workspace:retrieval-index', mode: 'write' as const }],
   validate: async (input, ctx) => {
     for (const path of input.paths ?? []) {
-      const check = checkReadPath(path, ctx.workspaceRoot)
+      // Explicit refresh paths are dereferenced by the retriever. Validate the
+      // real target here so a workspace symlink/junction cannot turn a lexical
+      // in-workspace path into an out-of-workspace read.
+      const check = await checkPathReal(path, ctx.workspaceRoot, { read: true })
       if (!check.ok) {
         return {
           ok: false as const,

@@ -376,7 +376,18 @@ export class AgentEngine {
             const event = result.value
             yield event
             if (isFactEvent(event)) {
-              state = yield* this.persistAndReduce(state, event, factDurability(event))
+              if (
+                event.type === 'workspace.mutation.started' &&
+                event.durableBeforeExecution
+              ) {
+                state = reduce(state, event)
+              } else {
+                state = yield* this.persistAndReduce(
+                  state,
+                  event,
+                  factDurability(event),
+                )
+              }
             }
             result = await execution.next()
           }
@@ -482,14 +493,25 @@ export class AgentEngine {
           this.d.config.intelligence?.completionReflection !== false &&
           shouldReflect(state, 'completion', this.reflectionInterval())
         ) {
+          const previousReflectionId = state.reflections[state.reflections.length - 1]?.id
           state = yield* this.recordReflection(state, 'completion', undefined, false)
-          const transitionFact: FactEvent = {
-            type: 'loop.transitioned',
-            transition: { reason: 'reflection_requested', trigger: 'completion' },
+          // recordReflection is single-flight. If an older decision-bearing
+          // reflection is still waiting for its evaluation window, the call
+          // intentionally no-ops; do not manufacture a transition/continue
+          // in that case or completion can spin until max_turns with no new
+          // model-visible information.
+          if (
+            state.reflections[state.reflections.length - 1]?.id !==
+            previousReflectionId
+          ) {
+            const transitionFact: FactEvent = {
+              type: 'loop.transitioned',
+              transition: { reason: 'reflection_requested', trigger: 'completion' },
+            }
+            yield transitionFact
+            state = yield* this.persistAndReduce(state, transitionFact, 'buffered')
+            continue
           }
-          yield transitionFact
-          state = yield* this.persistAndReduce(state, transitionFact, 'buffered')
-          continue
         }
 
         if (this.d.gate) {
@@ -505,6 +527,7 @@ export class AgentEngine {
             riskThreshold: this.d.gate.riskThreshold,
             staleEvidenceIds,
             workspaceRoot: this.d.gate.evidence?.workspaceRoot,
+            workspaceRevision: this.d.gate.evidence?.workspaceRevision,
           })
 
           if (gate.action === 'continue') {
@@ -1064,6 +1087,7 @@ export class AgentEngine {
           call,
           mode: state.mode,
           sessionId: state.sessionId,
+          turnId: state.turnId,
           workspaceRoot: state.workspace.root,
           artifactDir: this.d.config.artifactDir,
           signal,
@@ -1295,6 +1319,7 @@ function factDurability(event: FactEvent): 'buffered' | 'flush' {
     case 'tool.lane.selected':
     case 'loop.stagnation.detected':
     case 'strategy.adapted':
+    case 'workspace.mutation.started':
     case 'run.terminated':
       return 'flush'
     default:

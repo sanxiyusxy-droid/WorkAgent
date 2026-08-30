@@ -122,6 +122,7 @@ describe('Shell E2E through the engine', () => {
           { id: 's1', name: 'Shell', input: { command: `${NODE} chatty.js` } },
         ]),
         textTurn('done'),
+        textTurn('The command succeeded, but no workspace-wide validation was run.'),
       ],
     })
     try {
@@ -134,7 +135,7 @@ describe('Shell E2E through the engine', () => {
         world.runtime.engine,
         await stateWithUser(world, 'run the chatty command'),
       )
-      expect(result.terminal.reason).toBe('completed')
+      expect(result.terminal.reason).toBe('completed_with_unverified_items')
       const completed = result.facts.find(
         f => f.type === 'tool.call.completed' && f.result.callId === 's1',
       )

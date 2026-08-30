@@ -1,23 +1,25 @@
-import { configCandidates, loadAgentConfigFile } from '../src/app/config.js'
+import {
+  loadModelConfigFile,
+  modelConfigCandidates,
+} from '../src/app/config.js'
+import { resolveMainModelConfig } from '../src/app/modelConfig.js'
 import { AnthropicProvider } from '../src/model/providers/anthropic.js'
 import type { ModelRequest, ModelStreamEvent } from '../src/model/types.js'
 
-const file = await loadAgentConfigFile(configCandidates({
+const file = await loadModelConfigFile(modelConfigCandidates({
   workspaceRoot: process.cwd(),
   packageRoot: process.cwd(),
 }))
-const providerName = process.env.AGENT_PROVIDER ?? file.model.provider
-const apiKey = process.env.AGENT_API_KEY ?? file.model.apiKey
-const model = process.env.AGENT_MODEL ?? file.model.model
-const baseUrl = process.env.AGENT_BASE_URL ?? file.model.baseUrl
+const resolved = resolveMainModelConfig(file.model, process.env, file.source)
 
-if (providerName !== 'anthropic' || !apiKey || apiKey === 'FILL_ME' || !model) {
+if (!resolved || resolved.provider !== 'anthropic') {
   console.error(
     'Anthropic smoke test skipped: configure provider=anthropic, apiKey and model ' +
     'in ~/.code-agent/config.json or AGENT_PROVIDER/AGENT_API_KEY/AGENT_MODEL.',
   )
   process.exitCode = 2
 } else {
+  const { apiKey, model, baseUrl } = resolved
   const gateway = new AnthropicProvider({ apiKey, model, baseUrl })
   const request: ModelRequest = {
     system: 'This is a provider connectivity test. Follow the user instruction exactly.',

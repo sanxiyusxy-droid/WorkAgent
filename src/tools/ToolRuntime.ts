@@ -6,7 +6,7 @@ import type {
   ToolContractCheck,
   ToolObservation,
 } from '../core/messages.js'
-import type { AgentEvent } from '../core/events.js'
+import type { AgentEvent, FactEvent } from '../core/events.js'
 import type { AgentMode } from '../core/events.js'
 import type { ToolContext, ToolDefinition, ToolServices } from './Tool.js'
 import type { ToolRegistry } from './ToolRegistry.js'
@@ -25,6 +25,8 @@ export interface ExecuteToolRequest {
   call: ToolCall
   mode: AgentMode
   sessionId: string
+  /** Required by AgentEngine; optional only for isolated runtime tests. */
+  turnId?: string
   workspaceRoot: string
   artifactDir: string
   signal: AbortSignal
@@ -63,6 +65,15 @@ export class ToolRuntime {
        * removed from the model-facing schema.
        */
       writeLock?: () => boolean
+      /**
+       * Journal pre-commit hook. The scheduler buffers normal facts for
+       * deterministic replay order, so mutation intent must be flushed here
+       * before an external side effect is allowed to begin.
+       */
+      persistBeforeWorkspaceMutation?: (
+        fact: Extract<FactEvent, { type: 'workspace.mutation.started' }>,
+        turnId: string,
+      ) => Promise<void>
     },
   ) {
     this.idempotency = new IdempotencyLedger(deps.artifactDir)
@@ -232,7 +243,43 @@ export class ToolRuntime {
     //   fresh callId is still recognized as the same side effect
     // - 'invocation': call-level identity — only the crash-recovery replay
     //   of the SAME call dedupes; repeating the same command later is legal
-    const hasSideEffects = !tool.readOnly(parsed.data)
+    // Resource claims are primarily scheduler locks, but an explicit
+    // `file:*`/`workspace:*` write claim contradicts readOnly=true strongly
+    // enough that the runtime must fail closed. `process:workspace` alone is
+    // not sufficient: ShellReadOnly uses that write lock only to serialize a
+    // child process, without claiming a workspace mutation.
+    let resourceClaims: ReturnType<typeof tool.resources> = []
+    let resourceInspectionFailure: string | undefined
+    try {
+      resourceClaims = tool.resources(effectiveInput, ctx)
+    } catch (error) {
+      resourceInspectionFailure =
+        error instanceof Error ? error.message : String(error)
+    }
+    const hasWorkspaceWriteResource = resourceClaims.some(
+      claim =>
+        claim.mode === 'write' &&
+        (claim.resource === 'workspace:*' || claim.resource.startsWith('file:')),
+    )
+    const hasExplicitWorkspaceWriteResource =
+      tool.resourcesExplicit === true && hasWorkspaceWriteResource
+    const hasProcessWorkspaceWriteResource = resourceClaims.some(
+      claim => claim.mode === 'write' && claim.resource === 'process:workspace',
+    )
+    let declaredIntent: ReturnType<typeof tool.workspaceMutation>
+    let declarationFailure: string | undefined
+    try {
+      declaredIntent = tool.workspaceMutation(effectiveInput, ctx)
+    } catch (error) {
+      declarationFailure = error instanceof Error ? error.message : String(error)
+    }
+    const declaredReadOnly = tool.readOnly(effectiveInput)
+    const hasSideEffects =
+      !declaredReadOnly ||
+      declaredIntent !== undefined ||
+      hasExplicitWorkspaceWriteResource ||
+      resourceInspectionFailure !== undefined ||
+      declarationFailure !== undefined
     let idempotencyKey: string | undefined
     if (hasSideEffects) {
       if (this.deps.writeLock?.()) {
@@ -252,12 +299,12 @@ export class ToolRuntime {
               sessionId: req.sessionId,
               callId: req.call.id,
               toolName: tool.name,
-              args: parsed.data,
+              args: effectiveInput,
             })
           : IdempotencyLedger.computeOperationKey({
               sessionId: req.sessionId,
               toolName: tool.name,
-              args: parsed.data,
+              args: effectiveInput,
             })
       const record = this.idempotency.getRecord(idempotencyKey)
 
@@ -267,7 +314,7 @@ export class ToolRuntime {
         // or the proof no longer holds, the operation becomes re-executable
         // instead of being skipped forever.
         if (tool.inspectOutcome) {
-          const inspection = await tool.inspectOutcome(parsed.data, ctx, record)
+          const inspection = await tool.inspectOutcome(effectiveInput, ctx, record)
           if (inspection.applied) {
             yield this.deduplicated(req, startedAt, inspection.detail)
             return
@@ -303,7 +350,7 @@ export class ToolRuntime {
         // Verifiable tools adjudicate automatically via inspectOutcome;
         // everything else still refuses blind re-execution.
         if (tool.inspectOutcome) {
-          const inspection = await tool.inspectOutcome(parsed.data, ctx, record)
+          const inspection = await tool.inspectOutcome(effectiveInput, ctx, record)
           const to = inspection.applied ? 'resolved_applied' : 'resolved_not_applied'
           const from = this.idempotency.adjudicate(
             idempotencyKey,
@@ -343,6 +390,57 @@ export class ToolRuntime {
         this.deps.clock.isoNow(),
       )
       await this.idempotency.flush()
+    }
+
+    let mutationFact:
+      | Extract<FactEvent, { type: 'workspace.mutation.started' }>
+      | undefined
+    if (hasSideEffects) {
+      const hasWorkspaceWriteClaim =
+        declarationFailure !== undefined ||
+        resourceInspectionFailure !== undefined ||
+        hasWorkspaceWriteResource ||
+        (!declaredReadOnly && hasProcessWorkspaceWriteResource)
+      const intent = declaredIntent ??
+        (hasWorkspaceWriteClaim
+          ? {
+              scope: 'workspace' as const,
+              reason:
+                `${tool.name} has a workspace write resource but did not declare ` +
+                'an exact mutation scope; runtime opened a fail-closed obligation' +
+                (declarationFailure || resourceInspectionFailure
+                  ? ` (${declarationFailure ?? resourceInspectionFailure})`
+                  : ''),
+            }
+          : undefined)
+      if (intent) {
+        mutationFact = {
+          type: 'workspace.mutation.started',
+          mutationId: `mutation:${req.call.id}:${startedAt}`,
+          callId: req.call.id,
+          toolName: tool.name,
+          scope: intent.scope,
+          paths: intent.scope === 'paths' ? [...intent.paths] : [],
+          reason:
+            intent.reason ??
+            `${tool.name} declared a workspace side effect before execution`,
+          durableBeforeExecution: Boolean(
+            this.deps.persistBeforeWorkspaceMutation,
+          ),
+        }
+        if (this.deps.persistBeforeWorkspaceMutation) {
+          await this.deps.persistBeforeWorkspaceMutation(
+            mutationFact,
+            req.turnId ?? 'tool-runtime',
+          )
+        }
+        yield mutationFact
+        // Revision advances before execution, so evidence produced by this
+        // operation is temporally after the attempt and older receipts age.
+        this.deps.services?.evidence?.bumpWorkspaceRevision(
+          mutationFact.scope === 'paths' ? mutationFact.paths : undefined,
+        )
+      }
     }
 
     // live progress streaming (transient): rate-limited and budgeted, so
@@ -401,10 +499,23 @@ export class ToolRuntime {
         }
         if (output.facts) {
           for (const fact of output.facts) {
+            // Only ToolRuntime can create this fact before execution and
+            // prove it was journal-flushed. A tool output is necessarily
+            // post-execution, so never trust a forged durability marker.
+            if (fact.type === 'workspace.mutation.started') continue
             if (fact.type === 'workspace.changed') {
-              this.deps.services?.evidence?.bumpWorkspaceRevision(fact.path)
+              if (!mutationFact) {
+                this.deps.services?.evidence?.bumpWorkspaceRevision(fact.path)
+              }
               this.deps.services?.codeIntelligence?.invalidate(fact.path)
               this.deps.services?.codeRetriever?.invalidate(fact.path)
+              yield {
+                ...fact,
+                mutationId: mutationFact?.mutationId,
+                callId: req.call.id,
+                toolName: tool.name,
+              }
+              continue
             }
             yield fact
           }
@@ -445,12 +556,24 @@ export class ToolRuntime {
       // tool-declared facts flow back through events, never by direct mutation
       if (output.facts) {
         for (const fact of output.facts) {
+          // Only ToolRuntime can create this fact before execution and prove
+          // it was journal-flushed; tool output arrives after the side effect.
+          if (fact.type === 'workspace.mutation.started') continue
           if (fact.type === 'workspace.changed') {
             // the workspace moved on: receipts signed for the previous
             // revision become stale (finish-list §1.6)
-            this.deps.services?.evidence?.bumpWorkspaceRevision(fact.path)
+            if (!mutationFact) {
+              this.deps.services?.evidence?.bumpWorkspaceRevision(fact.path)
+            }
             this.deps.services?.codeIntelligence?.invalidate(fact.path)
             this.deps.services?.codeRetriever?.invalidate(fact.path)
+            yield {
+              ...fact,
+              mutationId: mutationFact?.mutationId,
+              callId: req.call.id,
+              toolName: tool.name,
+            }
+            continue
           }
           yield fact
         }
