@@ -118,8 +118,8 @@ describe('CLI cross-turn state sync (driveTurn)', () => {
           { id: 'w1', name: 'Write', input: { path: 'out.txt', content: 'v1', overwrite: true } },
         ]),
         toolCallTurn([{
-          id: 's1', name: 'Shell',
-          input: { command: 'rg v1 out.txt', evidenceFiles: ['out.txt'] },
+          id: 's1', name: 'FileAssert',
+          input: { path: 'out.txt', criterionIds: [], expected: { contains: ['v1'] } },
         }]),
         textTurn('turn 1 done'),
         // scripted response for turn 2
@@ -241,8 +241,8 @@ describe('CLI cross-turn state sync (driveTurn)', () => {
           { id: 'w2', name: 'Write', input: { path: 'out.txt', content: 'ok', overwrite: true } },
         ]),
         toolCallTurn([{
-          id: 'verify-w2', name: 'Shell',
-          input: { command: 'rg ok out.txt', evidenceFiles: ['out.txt'] },
+          id: 'verify-w2', name: 'FileAssert',
+          input: { path: 'out.txt', criterionIds: [], expected: { contains: ['ok'] } },
         }]),
         textTurn('done'),
       ],

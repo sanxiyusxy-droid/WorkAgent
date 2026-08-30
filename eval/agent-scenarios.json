@@ -146,11 +146,11 @@
           "calls": [
             {
               "id": "verify_conflicts",
-              "name": "Shell",
+              "name": "FileAssert",
               "input": {
-                "command": "rg alpha a.txt",
-                "evidenceKind": "command",
-                "evidenceFiles": ["a.txt"]
+                "path": "a.txt",
+                "criterionIds": [],
+                "expected": { "contains": ["alpha"] }
               }
             }
           ]
@@ -434,11 +434,11 @@
           "calls": [
             {
               "id": "verify_1",
-              "name": "Shell",
+              "name": "FileAssert",
               "input": {
-                "command": "rg beta b.txt",
-                "evidenceKind": "command",
-                "evidenceFiles": ["b.txt"]
+                "path": "b.txt",
+                "criterionIds": [],
+                "expected": { "contains": ["beta"] }
               }
             }
           ]

@@ -12,6 +12,7 @@ import { defineTool, type ToolContext, type ValidationResult } from '../Tool.js'
 const execFileAsync = promisify(execFile)
 
 const CriterionIds = z.array(z.string().min(1)).min(1).max(50)
+const OptionalCriterionIds = z.array(z.string().min(1)).max(50).default([])
 const BoundedSnippets = z.array(z.string().min(1).max(10_000)).max(50).default([])
 
 function criterionValidation(
@@ -118,7 +119,10 @@ export interface AssertionEvidenceOutput {
 
 const FileAssertInput = z.object({
   path: z.string().min(1),
-  criterionIds: CriterionIds,
+  // Empty ids are intentionally allowed for the durable workspace-mutation
+  // completion obligation. Such a receipt can prove the current file state,
+  // but cannot satisfy any approved-plan acceptance criterion.
+  criterionIds: OptionalCriterionIds,
   expected: z.object({
     exists: z.boolean().optional(),
     equals: z.string().max(100_000).optional(),
@@ -134,7 +138,8 @@ export const FileAssertTool = defineTool<
 >({
   name: 'FileAssert',
   description:
-    'Collect file_assertion evidence for approved criteria. Checks actual file ' +
+    'Collect file_assertion evidence for approved criteria or an outstanding ' +
+    'workspace-mutation obligation. Checks actual file ' +
     'existence/content and signs a receipt bound to the observed file version. ' +
     'Provide at least one of expected.exists/equals/contains/notContains.',
   inputSchema: FileAssertInput,
@@ -148,8 +153,10 @@ export const FileAssertTool = defineTool<
   permission: async () => ({ behavior: 'allow' }),
 
   validate: async (input, ctx) => {
-    const criteria = criterionValidation(input.criterionIds, 'file_assertion', ctx)
-    if (!criteria.ok) return criteria
+    if (input.criterionIds.length > 0) {
+      const criteria = criterionValidation(input.criterionIds, 'file_assertion', ctx)
+      if (!criteria.ok) return criteria
+    }
     const expected = input.expected
     if (
       expected.exists === undefined &&

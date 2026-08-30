@@ -125,10 +125,11 @@ describe('v1.1 loop intelligence', () => {
           } },
         ]),
         toolCallTurn([{
-          id: 'verify-attempted-path', name: 'ShellReadOnly',
+          id: 'verify-attempted-path', name: 'FileAssert',
           input: {
-            command: 'rg value a.ts',
-            evidenceFiles: ['a.ts'],
+            path: 'a.ts',
+            criterionIds: [],
+            expected: { contains: ['value'] },
           },
         }]),
         textTurn('done'),

@@ -4,6 +4,16 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.8.3] - 2026-08-30
+
+### Fixed
+- Removed the deterministic test/evaluation suite's undeclared dependency on
+  a system `rg` executable. Clean GitHub runners now use the built-in
+  `FileAssert` evidence tool, matching the runtime's portable tool contract.
+- `FileAssert` may issue an unbound, runtime-observed file receipt when no
+  acceptance criterion id is supplied. That receipt can close only the
+  durable mutation obligation and cannot satisfy an approved-plan criterion.
+
 ## [1.8.2] - 2026-08-29
 
 ### Security boundaries

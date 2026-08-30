@@ -1,5 +1,5 @@
 {
-  "description": "Read -> Edit (version precondition) -> Shell evidence -> final answer",
+  "description": "Read -> Edit (version precondition) -> FileAssert evidence -> final answer",
   "mode": "acceptEdits",
   "files": {
     "src/app.ts": "export const answer = 41\n"
@@ -24,11 +24,11 @@
       "calls": [
         {
           "id": "c3",
-          "name": "Shell",
+          "name": "FileAssert",
           "input": {
-            "command": "rg 42 src/app.ts",
-            "evidenceKind": "command",
-            "evidenceFiles": ["src/app.ts"]
+            "path": "src/app.ts",
+            "criterionIds": [],
+            "expected": { "contains": ["42"] }
           }
         }
       ]
@@ -53,7 +53,7 @@
     "loop.transitioned:tool_results_ready",
     "assistant.message.completed",
     "tool.call.accepted:c3",
-    "permission.decided:Shell:allow",
+    "permission.decided:FileAssert:allow",
     "evidence.recorded",
     "tool.call.completed:c3:ok",
     "tool.result.message",

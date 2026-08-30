@@ -45,8 +45,8 @@ describe('replan protocol E2E', () => {
           { id: 'w2', name: 'Write', input: { path: 'out.txt', content: 'ok', overwrite: true } },
         ]),
         toolCallTurn([{
-          id: 'verify-w2', name: 'Shell',
-          input: { command: 'rg ok out.txt', evidenceFiles: ['out.txt'] },
+          id: 'verify-w2', name: 'FileAssert',
+          input: { path: 'out.txt', criterionIds: [], expected: { contains: ['ok'] } },
         }]),
         textTurn('done'),
       ],

@@ -292,6 +292,45 @@ describe('durable workspace verification obligations', () => {
     }
   })
 
+  test('an unbound FileAssert closes a mutation obligation without forging plan evidence', async () => {
+    const world = await makeWorld({
+      mode: 'bypassPermissions',
+      turns: [
+        toolCallTurn([{
+          id: 'write_1', name: 'Write',
+          input: { path: 'out.txt', content: 'verified value', overwrite: true },
+        }]),
+        toolCallTurn([{
+          id: 'assert_1', name: 'FileAssert',
+          input: {
+            path: 'out.txt',
+            criterionIds: [],
+            expected: { contains: ['verified value'] },
+          },
+        }]),
+        textTurn('written and verified'),
+      ],
+    })
+    try {
+      const run = await collectRun(
+        world.runtime.engine,
+        await stateWithUser(world, 'write and verify out.txt'),
+      )
+      expect(run.terminal).toEqual({ reason: 'completed' })
+      const receipt = world.runtime.evidence.list().find(
+        item => item.invocation.tool === 'FileAssert',
+      )
+      expect(receipt).toMatchObject({
+        kind: 'file_assertion',
+        status: 'passed',
+        criterionIds: [],
+        workspaceRevision: 1,
+      })
+    } finally {
+      await world.cleanup()
+    }
+  })
+
   test('a deleted path can be verified as missing and becomes stale if it reappears', async () => {
     const DeletePath = defineTool({
       name: 'DeletePath',

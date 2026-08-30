@@ -256,7 +256,7 @@ npm run secret-scan   # exact staged Git-index blobs; unexpected empty fails clo
 npm run precommit     # staged scan that deliberately permits no eligible changes
 npm run secret-scan:all # tracked files; extensionless included, NUL binaries skipped
 npm run secret-scan:package # tracked files + built dist/ under the same fail-closed scan
-npm run check:release-tag -- --tag v1.8.2 # tag must equal package version
+npm run check:release-tag -- --tag v1.8.3 # tag must equal package version
 npm run build         # bundle dist/agent.mjs, embeds the source commit
 npm run eval          # deterministic Agent + recovery gate (no API key)
 npm run eval:faults   # deterministic fault scenarios only
